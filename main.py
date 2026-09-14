@@ -5,6 +5,7 @@ from alpaca.trading.client import TradingClient
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
+from alpaca.data.enums import DataFeed
 
 from indicators import sma, ema, rsi, volatility
 
@@ -32,7 +33,7 @@ def main():
     print("Modo: PAPER")
     print("ÓRDENES: DESACTIVADAS")
 
-    # Pedimos aproximadamente 6 meses de historial
+    # Pedimos 6 meses de velas usando IEX
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=180)
 
@@ -40,7 +41,8 @@ def main():
         symbol_or_symbols=["AAPL"],
         timeframe=TimeFrame.Day,
         start=start,
-        end=end
+        end=end,
+        feed=DataFeed.IEX
     )
 
     bars = data_client.get_stock_bars(request)
@@ -50,14 +52,13 @@ def main():
     closes = [float(bar.close) for bar in aapl_bars]
 
     print()
-    print("=== DIAGNOSTICO DE DATOS ===")
+    print("=== DATOS DEL MERCADO ===")
+    print(f"Feed utilizado: IEX")
     print(f"Velas recibidas: {len(closes)}")
 
     if len(closes) > 0:
         print(f"Primera vela: {closes[0]}")
         print(f"Última vela: {closes[-1]}")
-    else:
-        print("No se recibieron velas.")
 
     if len(closes) < 20:
         print("DATOS INSUFICIENTES — NO SE ANALIZA")
@@ -72,7 +73,6 @@ def main():
 
     print()
     print("=== AAPL — ANALISIS ===")
-    print(f"Velas recibidas: {len(closes)}")
     print(f"Precio: ${current_price:.2f}")
     print(f"SMA 20: ${sma20:.2f}")
     print(f"EMA 20: ${ema20:.2f}")
