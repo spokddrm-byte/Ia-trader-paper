@@ -9,10 +9,20 @@ from alpaca.data.enums import DataFeed
 
 from indicators import sma, ema, rsi, volatility
 from risk_manager import risk_check
+from bot_state import BotState
 
 
 def main():
+    # =========================
+    # ESTADO DEL BOT
+    # =========================
+
+    state = BotState()
+    state.reset_if_new_day()
+
+    # =========================
     # CONEXION CON ALPACA
+    # =========================
 
     api_key = os.environ["ALPACA_API_KEY"]
     secret_key = os.environ["ALPACA_SECRET_KEY"]
@@ -38,7 +48,21 @@ def main():
     print("Modo: PAPER")
     print("ORDENES: DESACTIVADAS")
 
+    # =========================
+    # ESTADO ACTUAL
+    # =========================
+
+    status = state.get_status()
+
+    print()
+    print("=== ESTADO DEL BOT ===")
+    print(f"Fecha: {status['date']}")
+    print(f"Operaciones hoy: {status['trades_today']}")
+    print(f"Perdida diaria: ${status['daily_loss']:.2f}")
+
+    # =========================
     # DATOS DEL MERCADO
+    # =========================
 
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=180)
@@ -68,7 +92,9 @@ def main():
 
     current_price = closes[-1]
 
+    # =========================
     # INDICADORES
+    # =========================
 
     sma20 = sma(closes, 20)
     ema20 = ema(closes, 20)
@@ -83,53 +109,62 @@ def main():
     print(f"RSI 14: {rsi14:.2f}")
     print(f"Volatilidad 20: {vol20:.4f}")
 
+    # =========================
     # ESTRATEGIA
+    # =========================
 
     print()
     print("=== ESTRATEGIA ===")
 
     if current_price > ema20 and rsi14 < 70:
         signal = "COMPRAR"
+
     elif current_price < ema20 and rsi14 > 30:
         signal = "VENDER"
+
     else:
         signal = "ESPERAR"
 
     print(f"Señal generada: {signal}")
 
+    # =========================
     # STOP LOSS DE PRUEBA
+    # =========================
 
     if signal == "COMPRAR":
         stop_price = current_price * 0.97
+
     elif signal == "VENDER":
         stop_price = current_price * 1.03
+
     else:
         stop_price = current_price
 
     print(f"Precio de entrada: ${current_price:.2f}")
     print(f"Stop de prueba: ${stop_price:.2f}")
 
+    # =========================
     # RISK MANAGER
+    # =========================
 
     print()
     print("=== RISK MANAGER ===")
-
-    daily_loss = 0
-    trades_today = 0
 
     approved, message = risk_check(
         signal=signal,
         account_value=account_value,
         entry_price=current_price,
         stop_price=stop_price,
-        daily_loss=daily_loss,
-        trades_today=trades_today
+        daily_loss=status["daily_loss"],
+        trades_today=status["trades_today"]
     )
 
     print(f"Autorizacion: {approved}")
     print(message)
 
+    # =========================
     # SEGURIDAD
+    # =========================
 
     print()
     print("=== SEGURIDAD ===")
@@ -137,10 +172,23 @@ def main():
     if approved:
         print("RIESGO APROBADO")
         print("PERO LA EJECUCION ESTA DESACTIVADA")
+        print("NO SE REGISTRA NINGUNA OPERACION")
         print("NO SE ENVIO NINGUNA ORDEN A ALPACA")
+
     else:
         print("OPERACION RECHAZADA POR RISK MANAGER")
         print("NO SE ENVIO NINGUNA ORDEN")
+
+    # =========================
+    # ESTADO FINAL
+    # =========================
+
+    final_status = state.get_status()
+
+    print()
+    print("=== ESTADO FINAL ===")
+    print(f"Operaciones hoy: {final_status['trades_today']}")
+    print(f"Perdida diaria: ${final_status['daily_loss']:.2f}")
 
     print()
     print("=== FIN DEL ANALISIS ===")
