@@ -44,8 +44,18 @@ def main():
 
     closes = [float(bar.close) for bar in aapl_bars]
 
+    print()
+    print("=== DIAGNOSTICO DE DATOS ===")
+    print(f"Velas recibidas: {len(closes)}")
+
+    if len(closes) > 0:
+        print(f"Primera vela: {closes[0]}")
+        print(f"Última vela: {closes[-1]}")
+    else:
+        print("No se recibieron velas.")
+
     if len(closes) < 20:
-        print("DATOS INSUFICIENTES")
+        print("DATOS INSUFICIENTES — NO SE ANALIZA")
         return
 
     current_price = closes[-1]
