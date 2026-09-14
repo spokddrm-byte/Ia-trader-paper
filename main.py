@@ -2,9 +2,10 @@ import os
 
 from alpaca.trading.client import TradingClient
 from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockLatestQuoteRequest
+from alpaca.data.requests import StockBarsRequest
+from alpaca.data.timeframe import TimeFrame
 
-from strategy import calculate_signal, risk_check
+from indicators import sma, ema, rsi, volatility
 
 
 def main():
@@ -22,7 +23,6 @@ def main():
         secret_key
     )
 
-    # Cuenta Paper
     account = trading_client.get_account()
 
     print("=== AI TRADER ===")
@@ -31,42 +31,52 @@ def main():
     print("Modo: PAPER")
     print("ÓRDENES: DESACTIVADAS")
 
-    # Obtener AAPL
-    request = StockLatestQuoteRequest(
-        symbol_or_symbols=["AAPL"]
+    # Obtener velas de AAPL
+    request = StockBarsRequest(
+        symbol_or_symbols=["AAPL"],
+        timeframe=TimeFrame.Day,
+        limit=100
     )
 
-    quotes = data_client.get_stock_latest_quote(request)
-    quote = quotes["AAPL"]
+    bars = data_client.get_stock_bars(request)
 
-    bid = quote.bid_price
-    ask = quote.ask_price
+    aapl_bars = bars["AAPL"]
 
-    print()
-    print("=== MERCADO ===")
-    print(f"AAPL Bid: ${bid}")
-    print(f"AAPL Ask: ${ask}")
+    closes = [float(bar.close) for bar in aapl_bars]
 
-    # Protección contra datos incompletos
-    if not bid or not ask or ask <= 0:
-        print("DATOS INCOMPLETOS — SEÑAL DESCARTADA")
+    if len(closes) < 20:
+        print("DATOS INSUFICIENTES")
         return
 
-    # Precio medio entre Bid y Ask
-    price = (bid + ask) / 2
+    current_price = closes[-1]
 
-    # Media temporal provisional
-    moving_average = price
-
-    signal = calculate_signal(price, moving_average)
-    result = risk_check(signal)
+    sma20 = sma(closes, 20)
+    ema20 = ema(closes, 20)
+    rsi14 = rsi(closes, 14)
+    vol20 = volatility(closes, 20)
 
     print()
-    print("=== ANALISIS ===")
-    print(f"Precio: ${price:.2f}")
-    print(f"Media móvil: ${moving_average:.2f}")
+    print("=== AAPL — ANALISIS ===")
+    print(f"Velas recibidas: {len(closes)}")
+    print(f"Precio: ${current_price:.2f}")
+    print(f"SMA 20: ${sma20:.2f}")
+    print(f"EMA 20: ${ema20:.2f}")
+    print(f"RSI 14: {rsi14:.2f}")
+    print(f"Volatilidad 20: {vol20:.4f}")
+
+    print()
+    print("=== DECISIÓN ===")
+
+    if current_price > ema20 and rsi14 < 70:
+        signal = "COMPRAR"
+
+    elif current_price < ema20 and rsi14 > 30:
+        signal = "VENDER"
+
+    else:
+        signal = "ESPERAR"
+
     print(f"Señal: {signal}")
-    print(f"Filtro de riesgo: {result}")
     print("ÓRDENES: DESACTIVADAS")
 
 
