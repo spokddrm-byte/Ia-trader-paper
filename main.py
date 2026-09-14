@@ -8,9 +8,14 @@ from alpaca.data.timeframe import TimeFrame
 from alpaca.data.enums import DataFeed
 
 from indicators import sma, ema, rsi, volatility
+from risk_manager import risk_check
 
 
 def main():
+    # =========================
+    # CONEXIÓN CON ALPACA
+    # =========================
+
     api_key = os.environ["ALPACA_API_KEY"]
     secret_key = os.environ["ALPACA_SECRET_KEY"]
 
@@ -27,13 +32,19 @@ def main():
 
     account = trading_client.get_account()
 
+    account_value = float(account.equity)
+
     print("=== AI TRADER ===")
     print(f"Cuenta: {account.status}")
     print(f"Saldo: ${account.cash}")
+    print(f"Valor de cuenta: ${account_value:.2f}")
     print("Modo: PAPER")
     print("ÓRDENES: DESACTIVADAS")
 
-    # Pedimos 6 meses de velas usando IEX
+    # =========================
+    # DATOS DEL MERCADO
+    # =========================
+
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=180)
 
@@ -46,25 +57,25 @@ def main():
     )
 
     bars = data_client.get_stock_bars(request)
-
     aapl_bars = bars["AAPL"]
 
     closes = [float(bar.close) for bar in aapl_bars]
 
     print()
     print("=== DATOS DEL MERCADO ===")
-    print(f"Feed utilizado: IEX")
+    print("Símbolo: AAPL")
+    print("Feed: IEX")
     print(f"Velas recibidas: {len(closes)}")
-
-    if len(closes) > 0:
-        print(f"Primera vela: {closes[0]}")
-        print(f"Última vela: {closes[-1]}")
 
     if len(closes) < 20:
         print("DATOS INSUFICIENTES — NO SE ANALIZA")
         return
 
     current_price = closes[-1]
+
+    # =========================
+    # INDICADORES
+    # =========================
 
     sma20 = sma(closes, 20)
     ema20 = ema(closes, 20)
@@ -76,22 +87,4 @@ def main():
     print(f"Precio: ${current_price:.2f}")
     print(f"SMA 20: ${sma20:.2f}")
     print(f"EMA 20: ${ema20:.2f}")
-    print(f"RSI 14: {rsi14:.2f}")
-    print(f"Volatilidad 20: {vol20:.4f}")
-
-    print()
-    print("=== DECISIÓN ===")
-
-    if current_price > ema20 and rsi14 < 70:
-        signal = "COMPRAR"
-    elif current_price < ema20 and rsi14 > 30:
-        signal = "VENDER"
-    else:
-        signal = "ESPERAR"
-
-    print(f"Señal: {signal}")
-    print("ÓRDENES: DESACTIVADAS")
-
-
-if __name__ == "__main__":
-    main()
+    print(f"RSI
