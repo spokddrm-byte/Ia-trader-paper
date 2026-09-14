@@ -1,4 +1,5 @@
 import os
+from datetime import datetime, timedelta, timezone
 
 from alpaca.trading.client import TradingClient
 from alpaca.data.historical import StockHistoricalDataClient
@@ -31,11 +32,15 @@ def main():
     print("Modo: PAPER")
     print("ÓRDENES: DESACTIVADAS")
 
-    # Obtener velas de AAPL
+    # Pedimos aproximadamente 6 meses de historial
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=180)
+
     request = StockBarsRequest(
         symbol_or_symbols=["AAPL"],
         timeframe=TimeFrame.Day,
-        limit=100
+        start=start,
+        end=end
     )
 
     bars = data_client.get_stock_bars(request)
@@ -79,10 +84,8 @@ def main():
 
     if current_price > ema20 and rsi14 < 70:
         signal = "COMPRAR"
-
     elif current_price < ema20 and rsi14 > 30:
         signal = "VENDER"
-
     else:
         signal = "ESPERAR"
 
