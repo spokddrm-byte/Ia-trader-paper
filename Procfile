@@ -1,1 +1,1 @@
-web: python paper_check.py
+web: python paper_orders_check.py
