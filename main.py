@@ -26,11 +26,20 @@ def main():
     initialize_database()
 
     # =========================
-    # CONEXION CON ALPACA
+    # CREDENCIALES
     # =========================
 
-    api_key = os.environ["ALPACA_API_KEY"]
-    secret_key = os.environ["ALPACA_SECRET_KEY"]
+    api_key = os.getenv("APCA_API_KEY_ID")
+    secret_key = os.getenv("APCA_API_SECRET_KEY")
+
+    if not api_key or not secret_key:
+        raise RuntimeError(
+            "FALTAN APCA_API_KEY_ID O APCA_API_SECRET_KEY EN RAILWAY"
+        )
+
+    # =========================
+    # CONEXION CON ALPACA
+    # =========================
 
     trading_client = TradingClient(
         api_key,
@@ -46,12 +55,16 @@ def main():
     account = trading_client.get_account()
     account_value = float(account.equity)
 
-    print("=== AI TRADER ===")
+    print("==============================================")
+    print("          AI TRADER — PAPER ANALYSIS")
+    print("==============================================")
+    print()
+    print("CONEXION CON ALPACA: OK")
     print(f"Cuenta: {account.status}")
-    print(f"Saldo: ${account.cash}")
-    print(f"Valor de cuenta: ${account_value:.2f}")
-    print("Modo: PAPER")
+    print(f"Capital: ${account_value:,.2f}")
+    print("MODO: PAPER")
     print("ORDENES: DESACTIVADAS")
+    print()
 
     # =========================
     # ESTADO DEL BOT
@@ -60,14 +73,29 @@ def main():
     trades_today = get_today_trade_count()
     daily_loss = get_today_loss()
 
-    print()
     print("=== ESTADO DEL BOT ===")
     print(f"Fecha UTC: {datetime.now(timezone.utc).date()}")
     print(f"Operaciones ejecutadas hoy: {trades_today}")
     print(f"Perdida diaria: ${daily_loss:.2f}")
+    print()
 
     # =========================
-    # DATOS DEL MERCADO
+    # MERCADO
+    # =========================
+
+    clock = trading_client.get_clock()
+
+    print("=== ESTADO DEL MERCADO ===")
+    print(f"Mercado abierto: {clock.is_open}")
+
+    if not clock.is_open:
+        print(f"Proxima apertura: {clock.next_open}")
+        print(f"Proximo cierre: {clock.next_close}")
+
+    print()
+
+    # =========================
+    # DATOS AAPL
     # =========================
 
     end = datetime.now(timezone.utc)
@@ -86,40 +114,40 @@ def main():
 
     closes = [float(bar.close) for bar in aapl_bars]
 
-    print()
     print("=== DATOS DEL MERCADO ===")
     print("Simbolo: AAPL")
     print("Feed: IEX")
     print(f"Velas recibidas: {len(closes)}")
+    print()
 
     if len(closes) < 20:
-        print("DATOS INSUFICIENTES - NO SE ANALIZA")
+        print("DATOS INSUFICIENTES")
+        print("NO SE GENERA SEÑAL")
         return
-
-    current_price = closes[-1]
 
     # =========================
     # INDICADORES
     # =========================
+
+    current_price = closes[-1]
 
     sma20 = sma(closes, 20)
     ema20 = ema(closes, 20)
     rsi14 = rsi(closes, 14)
     vol20 = volatility(closes, 20)
 
-    print()
-    print("=== AAPL - ANALISIS ===")
+    print("=== AAPL — ANALISIS ===")
     print(f"Precio: ${current_price:.2f}")
     print(f"SMA 20: ${sma20:.2f}")
     print(f"EMA 20: ${ema20:.2f}")
     print(f"RSI 14: {rsi14:.2f}")
     print(f"Volatilidad 20: {vol20:.4f}")
+    print()
 
     # =========================
     # ESTRATEGIA
     # =========================
 
-    print()
     print("=== ESTRATEGIA ===")
 
     if current_price > ema20 and rsi14 < 70:
@@ -132,6 +160,7 @@ def main():
         signal = "ESPERAR"
 
     print(f"Señal generada: {signal}")
+    print()
 
     # =========================
     # STOP LOSS
@@ -146,15 +175,13 @@ def main():
     else:
         stop_price = current_price
 
-    print(f"Precio de entrada: ${current_price:.2f}")
-    print(f"Stop de prueba: ${stop_price:.2f}")
+    print("=== GESTION DE RIESGO ===")
+    print(f"Entrada de referencia: ${current_price:.2f}")
+    print(f"Stop de referencia: ${stop_price:.2f}")
 
     # =========================
     # RISK MANAGER
     # =========================
-
-    print()
-    print("=== RISK MANAGER ===")
 
     approved, message = risk_check(
         signal=signal,
@@ -167,57 +194,54 @@ def main():
 
     print(f"Autorizacion: {approved}")
     print(message)
-
-    # =========================
-    # BASE DE DATOS
-    # =========================
-
     print()
-    print("=== DATABASE ===")
+
+    # =========================
+    # REGISTRO
+    # =========================
+
+    position_size = 0
+
+    if approved:
+        try:
+            position_size = int(message.split("—")[1].split()[0])
+        except (IndexError, ValueError):
+            position_size = 0
 
     event_id = log_event(
         symbol="AAPL",
         signal=signal,
         entry_price=current_price,
         stop_price=stop_price,
-        position_size=100 if approved else 0,
+        position_size=position_size,
         status="SIGNAL_ONLY",
         profit_loss=0.0
     )
 
-    print(f"Analisis registrado en base de datos: #{event_id}")
+    print("=== DATABASE ===")
+    print(f"Analisis registrado: #{event_id}")
+    print(f"Tamaño calculado: {position_size}")
     print("Estado: SIGNAL_ONLY")
-    print("No cuenta como operacion ejecutada")
+    print()
 
     # =========================
     # SEGURIDAD
     # =========================
 
-    print()
     print("=== SEGURIDAD ===")
 
     if approved:
         print("RIESGO APROBADO")
-        print("PERO LA EJECUCION ESTA DESACTIVADA")
-        print("NO SE ENVIO NINGUNA ORDEN A ALPACA")
+        print("ORDEN NO ENVIADA")
+        print("ESTE ARCHIVO SOLO ANALIZA")
     else:
-        print("OPERACION RECHAZADA POR RISK MANAGER")
-        print("NO SE ENVIO NINGUNA ORDEN")
-
-    # =========================
-    # ESTADO FINAL
-    # =========================
-
-    final_trades = get_today_trade_count()
-    final_loss = get_today_loss()
+        print("OPERACION NO AUTORIZADA")
+        print("ORDEN NO ENVIADA")
 
     print()
-    print("=== ESTADO FINAL ===")
-    print(f"Operaciones ejecutadas hoy: {final_trades}")
-    print(f"Perdida diaria: ${final_loss:.2f}")
-
-    print()
-    print("=== FIN DEL ANALISIS ===")
+    print("==============================================")
+    print("          ANALISIS COMPLETADO")
+    print("==============================================")
 
 
 if __name__ == "__main__":
