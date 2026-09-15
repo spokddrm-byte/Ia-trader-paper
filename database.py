@@ -134,4 +134,46 @@ def get_today_trade_count():
 # =========================
 
 def get_today_loss():
-    events
+    events = get_today_events()
+
+    total_loss = 0.0
+
+    for event in events:
+        profit_loss = float(event["profit_loss"])
+
+        if profit_loss < 0:
+            total_loss += abs(profit_loss)
+
+    return total_loss
+
+
+# =========================
+# PRUEBA
+# =========================
+
+if __name__ == "__main__":
+
+    print("=== AI TRADER - DATABASE ===")
+
+    initialize_database()
+
+    event_id = log_event(
+        symbol="AAPL",
+        signal="COMPRAR",
+        entry_price=333.00,
+        stop_price=323.01,
+        position_size=100,
+        status="SIGNAL_ONLY",
+        profit_loss=0.0
+    )
+
+    print(f"Evento registrado: #{event_id}")
+
+    events = get_today_events()
+
+    print(f"Eventos de hoy: {len(events)}")
+    print(f"Operaciones ejecutadas: {get_today_trade_count()}")
+    print(f"Pérdida del día: ${get_today_loss():.2f}")
+
+    print()
+    print("BASE DE DATOS FUNCIONANDO 👽")
