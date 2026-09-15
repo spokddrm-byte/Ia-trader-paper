@@ -1,20 +1,37 @@
 import os
+import uuid
 from datetime import datetime, timedelta, timezone
 
 from alpaca.trading.client import TradingClient
+from alpaca.trading.requests import (
+    GetOrdersRequest,
+    MarketOrderRequest,
+    StopLossRequest
+)
+from alpaca.trading.enums import (
+    OrderSide,
+    OrderClass,
+    QueryOrderStatus,
+    TimeInForce
+)
+
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.data.enums import DataFeed
 
 from indicators import sma, ema, rsi, volatility
-from risk_manager import risk_check
+from risk_manager import risk_check, calculate_position_size
+
 from database import (
     initialize_database,
     log_event,
     get_today_trade_count,
     get_today_loss
 )
+
+
+SYMBOL = "AAPL"
 
 
 def main():
@@ -56,14 +73,13 @@ def main():
     account_value = float(account.equity)
 
     print("==============================================")
-    print("          AI TRADER — PAPER ANALYSIS")
+    print("       AI TRADER — PAPER TRADING")
     print("==============================================")
     print()
     print("CONEXION CON ALPACA: OK")
     print(f"Cuenta: {account.status}")
     print(f"Capital: ${account_value:,.2f}")
     print("MODO: PAPER")
-    print("ORDENES: DESACTIVADAS")
     print()
 
     # =========================
@@ -80,7 +96,7 @@ def main():
     print()
 
     # =========================
-    # MERCADO
+    # ESTADO DEL MERCADO
     # =========================
 
     clock = trading_client.get_clock()
@@ -91,18 +107,70 @@ def main():
     if not clock.is_open:
         print(f"Proxima apertura: {clock.next_open}")
         print(f"Proximo cierre: {clock.next_close}")
+        print()
+        print("MERCADO CERRADO")
+        print("NO SE ENVIARA NINGUNA ORDEN")
+        print("==============================================")
+        return
 
     print()
 
     # =========================
-    # DATOS AAPL
+    # PROTECCION:
+    # POSICION EXISTENTE
+    # =========================
+
+    positions = trading_client.get_all_positions()
+
+    existing_position = None
+
+    for position in positions:
+        if position.symbol == SYMBOL:
+            existing_position = position
+            break
+
+    if existing_position is not None:
+        print("=== PROTECCION DE POSICION ===")
+        print(f"Ya existe una posicion en {SYMBOL}")
+        print(f"Cantidad: {existing_position.qty}")
+        print("NO SE ENVIARA OTRA COMPRA")
+        print("==============================================")
+        return
+
+    # =========================
+    # PROTECCION:
+    # ORDEN PENDIENTE
+    # =========================
+
+    open_orders_request = GetOrdersRequest(
+        status=QueryOrderStatus.OPEN,
+        limit=50,
+        nested=True
+    )
+
+    open_orders = trading_client.get_orders(
+        filter=open_orders_request
+    )
+
+    for order in open_orders:
+        if order.symbol == SYMBOL:
+            print("=== PROTECCION DE ORDEN ===")
+            print(f"Ya existe una orden pendiente para {SYMBOL}")
+            print(f"ID: {order.id}")
+            print(f"Estado: {order.status}")
+            print("NO SE ENVIARA OTRA ORDEN")
+            print("==============================================")
+            return
+
+    # =========================
+    # DATOS DEL MERCADO
     # =========================
 
     end = datetime.now(timezone.utc)
     start = end - timedelta(days=180)
 
     request = StockBarsRequest(
-        symbol_or_symbols=["AAPL"],
+        symbol_or_symbols=[SYMBOL],
         timeframe=TimeFrame.Day,
         start=start,
         end=end,
@@ -110,12 +178,15 @@ def main():
     )
 
     bars = data_client.get_stock_bars(request)
-    aapl_bars = bars["AAPL"]
+    symbol_bars = bars[SYMBOL]
 
-    closes = [float(bar.close) for bar in aapl_bars]
+    closes = [
+        float(bar.close)
+        for bar in symbol_bars
+    ]
 
     print("=== DATOS DEL MERCADO ===")
-    print("Simbolo: AAPL")
+    print(f"Simbolo: {SYMBOL}")
     print("Feed: IEX")
     print(f"Velas recibidas: {len(closes)}")
     print()
@@ -163,21 +234,26 @@ def main():
     print()
 
     # =========================
+    # SOLO LONG
+    # =========================
+
+    if signal != "COMPRAR":
+        print("=== EJECUCION ===")
+        print(f"Señal: {signal}")
+        print("Esta versión solo abre posiciones LONG.")
+        print("NO SE ENVIA NINGUNA ORDEN")
+        print("==============================================")
+        return
+
+    # =========================
     # STOP LOSS
     # =========================
 
-    if signal == "COMPRAR":
-        stop_price = current_price * 0.97
-
-    elif signal == "VENDER":
-        stop_price = current_price * 1.03
-
-    else:
-        stop_price = current_price
+    stop_price = round(current_price * 0.97, 2)
 
     print("=== GESTION DE RIESGO ===")
     print(f"Entrada de referencia: ${current_price:.2f}")
-    print(f"Stop de referencia: ${stop_price:.2f}")
+    print(f"Stop loss: ${stop_price:.2f}")
 
     # =========================
     # RISK MANAGER
@@ -196,51 +272,120 @@ def main():
     print(message)
     print()
 
+    if not approved:
+        print("RISK MANAGER RECHAZO LA OPERACION")
+        print("NO SE ENVIA NINGUNA ORDEN")
+        print("==============================================")
+        return
+
     # =========================
-    # REGISTRO
+    # TAMAÑO DE POSICION
     # =========================
 
-    position_size = 0
+    position_size = calculate_position_size(
+        account_value=account_value,
+        entry_price=current_price,
+        stop_price=stop_price
+    )
 
-    if approved:
-        try:
-            position_size = int(message.split("—")[1].split()[0])
-        except (IndexError, ValueError):
-            position_size = 0
+    if position_size <= 0:
+        print("TAMAÑO DE POSICION INVALIDO")
+        print("NO SE ENVIA NINGUNA ORDEN")
+        return
+
+    print("=== POSICION ===")
+    print(f"Acciones: {position_size}")
+    print(f"Riesgo por accion: ${abs(current_price - stop_price):.2f}")
+    print()
+
+    # =========================
+    # ORDEN PAPER
+    # =========================
+
+    client_order_id = (
+        f"ai-trader-{SYMBOL.lower()}-"
+        f"{uuid.uuid4().hex[:12]}"
+    )
+
+    print("=== EJECUCION PAPER ===")
+    print("Riesgo aprobado")
+    print("Sin posicion existente")
+    print("Sin orden pendiente")
+    print(f"Orden: COMPRA {position_size} {SYMBOL}")
+    print(f"Stop loss: ${stop_price:.2f}")
+    print("Enviando orden a Alpaca Paper...")
+
+    order_request = MarketOrderRequest(
+        symbol=SYMBOL,
+        qty=position_size,
+        side=OrderSide.BUY,
+        time_in_force=TimeInForce.DAY,
+        order_class=OrderClass.OTO,
+        stop_loss=StopLossRequest(
+            stop_price=stop_price
+        ),
+        client_order_id=client_order_id
+    )
+
+    try:
+
+        order = trading_client.submit_order(
+            order_data=order_request
+        )
+
+    except Exception as error:
+
+        print()
+        print("==============================================")
+        print("ERROR AL ENVIAR LA ORDEN")
+        print("==============================================")
+        print(str(error))
+        print("NO SE REGISTRA COMO EJECUTADA")
+        return
+
+    # =========================
+    # RESULTADO
+    # =========================
+
+    print()
+    print("==============================================")
+    print("ORDEN PAPER ENVIADA")
+    print("==============================================")
+    print(f"ID: {order.id}")
+    print(f"Estado: {order.status}")
+    print(f"Simbolo: {order.symbol}")
+    print(f"Cantidad: {order.qty}")
+    print(f"Lado: {order.side}")
+    print(f"Stop loss: ${stop_price:.2f}")
+    print("==============================================")
+
+    # =========================
+    # DATABASE
+    # =========================
 
     event_id = log_event(
-        symbol="AAPL",
+        symbol=SYMBOL,
         signal=signal,
         entry_price=current_price,
         stop_price=stop_price,
         position_size=position_size,
-        status="SIGNAL_ONLY",
+        status="ORDER_SUBMITTED",
         profit_loss=0.0
     )
 
-    print("=== DATABASE ===")
-    print(f"Analisis registrado: #{event_id}")
-    print(f"Tamaño calculado: {position_size}")
-    print("Estado: SIGNAL_ONLY")
     print()
-
-    # =========================
-    # SEGURIDAD
-    # =========================
+    print("=== DATABASE ===")
+    print(f"Evento registrado: #{event_id}")
+    print("Estado: ORDER_SUBMITTED")
+    print()
 
     print("=== SEGURIDAD ===")
-
-    if approved:
-        print("RIESGO APROBADO")
-        print("ORDEN NO ENVIADA")
-        print("ESTE ARCHIVO SOLO ANALIZA")
-    else:
-        print("OPERACION NO AUTORIZADA")
-        print("ORDEN NO ENVIADA")
-
+    print("ORDEN ENVIADA SOLAMENTE A ALPACA PAPER")
+    print("NO ES DINERO REAL")
+    print("STOP LOSS ASOCIADO A LA ORDEN")
     print()
     print("==============================================")
-    print("          ANALISIS COMPLETADO")
+    print("          CICLO COMPLETADO")
     print("==============================================")
 
 
