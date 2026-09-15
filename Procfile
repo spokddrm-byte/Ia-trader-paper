@@ -1,1 +1,1 @@
-web: python paper_orders_check.py
+web: python -c "import os; from alpaca.trading.client import TradingClient; c=TradingClient(os.getenv('APCA_API_KEY_ID'),os.getenv('APCA_API_SECRET_KEY'),paper=True); print('MERCADO ABIERTO:', c.get_clock().is_open); print('ABRE:', c.get_clock().next_open); print('CIERRA:', c.get_clock().next_close)"
