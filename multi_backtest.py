@@ -9,13 +9,14 @@ from alpaca.data.enums import DataFeed
 
 
 # ============================================================
-# AI TRADER — MULTI BACKTEST V3
+# AI TRADER — MULTI BACKTEST V4
 # ============================================================
 #
 # SOLO BACKTEST
 # NO ENVÍA ÓRDENES
 #
-# V3:
+# V4:
+# - Mantiene la lógica de V3
 # - Datos OHLC
 # - Datos ajustados por splits/dividendos
 # - Datos ordenados cronológicamente
@@ -34,7 +35,18 @@ from alpaca.data.enums import DataFeed
 # - Sharpe
 # - Rachas de pérdidas
 # - Buy & Hold
-# - Exportación a backtest_results.txt
+# - AUDITORÍA DETALLADA DE CADA OPERACIÓN
+# - Fecha de entrada
+# - Precio de entrada
+# - Stop inicial
+# - Fecha de salida
+# - Precio de salida
+# - Motivo de salida
+# - Acciones
+# - P&L
+# - Rendimiento de la operación
+# - Comisiones
+# - Exportación de operaciones
 #
 # IMPORTANTE:
 # NO PAPER ORDERS
@@ -412,7 +424,7 @@ def calculate_max_losing_streak(
 
 
 # ============================================================
-# BACKTEST V3
+# BACKTEST V4
 # ============================================================
 
 def run_backtest(data):
@@ -455,6 +467,12 @@ def run_backtest(data):
     entry_price = 0.0
 
     stop_price = 0.0
+
+    entry_date = None
+
+    entry_commission = 0.0
+
+    entry_value = 0.0
 
     trades = []
 
@@ -599,6 +617,19 @@ def run_backtest(data):
                         )
                     )
 
+                    entry_date = (
+                        dates[i]
+                    )
+
+                    entry_commission = (
+                        commission
+                    )
+
+                    entry_value = (
+                        entry_price *
+                        position
+                    )
+
                     total_commissions += (
                         commission
                     )
@@ -671,6 +702,10 @@ def run_backtest(data):
                 )
 
 
+            # ------------------------------------------------
+            # EJECUTAR SALIDA
+            # ------------------------------------------------
+
             if exit_reason is not None:
 
                 gross_result = (
@@ -679,7 +714,7 @@ def run_backtest(data):
                 ) * position
 
 
-                commission = (
+                exit_commission = (
                     position *
                     COMMISSION_PER_SHARE
                 )
@@ -687,7 +722,7 @@ def run_backtest(data):
 
                 profit_loss = (
                     gross_result -
-                    commission
+                    exit_commission
                 )
 
 
@@ -697,16 +732,74 @@ def run_backtest(data):
                 )
 
 
-                capital -= commission
-
-
-                trades.append(
-                    profit_loss
+                capital -= (
+                    exit_commission
                 )
 
 
                 total_commissions += (
-                    commission
+                    exit_commission
+                )
+
+
+                total_trade_commission = (
+                    entry_commission +
+                    exit_commission
+                )
+
+
+                trade_return = (
+                    profit_loss /
+                    entry_value
+                ) * 100
+
+
+                trade_record = {
+
+                    "entry_date":
+                        entry_date,
+
+                    "entry_price":
+                        entry_price,
+
+                    "stop_price":
+                        stop_price,
+
+                    "shares":
+                        position,
+
+                    "entry_value":
+                        entry_value,
+
+                    "entry_commission":
+                        entry_commission,
+
+                    "exit_date":
+                        dates[i],
+
+                    "exit_price":
+                        execution_price,
+
+                    "exit_reason":
+                        exit_reason,
+
+                    "exit_commission":
+                        exit_commission,
+
+                    "total_commission":
+                        total_trade_commission,
+
+                    "profit_loss":
+                        profit_loss,
+
+                    "return_percent":
+                        trade_return
+
+                }
+
+
+                trades.append(
+                    trade_record
                 )
 
 
@@ -724,6 +817,12 @@ def run_backtest(data):
                 entry_price = 0.0
 
                 stop_price = 0.0
+
+                entry_date = None
+
+                entry_commission = 0.0
+
+                entry_value = 0.0
 
 
         # ====================================================
@@ -805,7 +904,7 @@ def run_backtest(data):
         ) * position
 
 
-        commission = (
+        exit_commission = (
             position *
             COMMISSION_PER_SHARE
         )
@@ -813,7 +912,7 @@ def run_backtest(data):
 
         profit_loss = (
             gross_result -
-            commission
+            exit_commission
         )
 
 
@@ -823,16 +922,74 @@ def run_backtest(data):
         )
 
 
-        capital -= commission
-
-
-        trades.append(
-            profit_loss
+        capital -= (
+            exit_commission
         )
 
 
         total_commissions += (
-            commission
+            exit_commission
+        )
+
+
+        total_trade_commission = (
+            entry_commission +
+            exit_commission
+        )
+
+
+        trade_return = (
+            profit_loss /
+            entry_value
+        ) * 100
+
+
+        trade_record = {
+
+            "entry_date":
+                entry_date,
+
+            "entry_price":
+                entry_price,
+
+            "stop_price":
+                stop_price,
+
+            "shares":
+                position,
+
+            "entry_value":
+                entry_value,
+
+            "entry_commission":
+                entry_commission,
+
+            "exit_date":
+                dates[-1],
+
+            "exit_price":
+                final_price,
+
+            "exit_reason":
+                "FINAL",
+
+            "exit_commission":
+                exit_commission,
+
+            "total_commission":
+                total_trade_commission,
+
+            "profit_loss":
+                profit_loss,
+
+            "return_percent":
+                trade_return
+
+        }
+
+
+        trades.append(
+            trade_record
         )
 
 
@@ -848,7 +1005,6 @@ def run_backtest(data):
         position = 0
 
 
-        # Añadir el capital final a la equity curve
         equity_curve.append(
             capital
         )
@@ -888,9 +1044,15 @@ def run_backtest(data):
         win_rate = 0.0
 
 
+    profit_loss_values = [
+        trade["profit_loss"]
+        for trade in trades
+    ]
+
+
     gross_profit = sum(
         trade
-        for trade in trades
+        for trade in profit_loss_values
         if trade > 0
     )
 
@@ -898,7 +1060,7 @@ def run_backtest(data):
     gross_loss = abs(
         sum(
             trade
-            for trade in trades
+            for trade in profit_loss_values
             if trade < 0
         )
     )
@@ -1004,7 +1166,7 @@ def run_backtest(data):
 
     max_losing_streak = (
         calculate_max_losing_streak(
-            trades
+            profit_loss_values
         )
     )
 
@@ -1013,14 +1175,14 @@ def run_backtest(data):
     # MEJOR / PEOR TRADE
     # ========================================================
 
-    if trades:
+    if profit_loss_values:
 
         best_trade = max(
-            trades
+            profit_loss_values
         )
 
         worst_trade = min(
-            trades
+            profit_loss_values
         )
 
     else:
@@ -1028,6 +1190,38 @@ def run_backtest(data):
         best_trade = 0.0
 
         worst_trade = 0.0
+
+
+    # ========================================================
+    # DISTRIBUCIÓN DE SALIDAS
+    # ========================================================
+
+    stop_count = sum(
+        1
+        for trade in trades
+        if trade["exit_reason"] == "STOP"
+    )
+
+
+    stop_gap_count = sum(
+        1
+        for trade in trades
+        if trade["exit_reason"] == "STOP_GAP"
+    )
+
+
+    ema_count = sum(
+        1
+        for trade in trades
+        if trade["exit_reason"] == "EMA"
+    )
+
+
+    final_count = sum(
+        1
+        for trade in trades
+        if trade["exit_reason"] == "FINAL"
+    )
 
 
     # ========================================================
@@ -1110,7 +1304,22 @@ def run_backtest(data):
             worst_trade,
 
         "commissions":
-            total_commissions
+            total_commissions,
+
+        "stop_count":
+            stop_count,
+
+        "stop_gap_count":
+            stop_gap_count,
+
+        "ema_count":
+            ema_count,
+
+        "final_count":
+            final_count,
+
+        "trade_details":
+            trades
 
     }
 
@@ -1126,7 +1335,7 @@ print(
 )
 
 print(
-    "       AI TRADER — MULTI BACKTEST V3"
+    "       AI TRADER — MULTI BACKTEST V4"
 )
 
 print(
@@ -1149,6 +1358,10 @@ print(
 
 print(
     "SLIPPAGE + COMISIONES ACTIVOS"
+)
+
+print(
+    "AUDITORÍA DETALLADA DE OPERACIONES"
 )
 
 print()
@@ -1484,6 +1697,26 @@ for result in results:
     )
 
     print(
+        f"  Salidas por STOP: "
+        f"{result['stop_count']}"
+    )
+
+    print(
+        f"  Salidas por STOP_GAP: "
+        f"{result['stop_gap_count']}"
+    )
+
+    print(
+        f"  Salidas por EMA: "
+        f"{result['ema_count']}"
+    )
+
+    print(
+        f"  Cierres finales: "
+        f"{result['final_count']}"
+    )
+
+    print(
         f"  Sharpe: "
         f"{result['sharpe']:.2f}"
     )
@@ -1497,13 +1730,174 @@ for result in results:
 
 
 # ============================================================
-# EXPORTAR RESULTADOS
+# AUDITORÍA DE OPERACIONES
+# ============================================================
+
+print()
+
+print(
+    "=============================================="
+)
+
+print(
+    "          AUDITORIA DE OPERACIONES"
+)
+
+print(
+    "=============================================="
+)
+
+print()
+
+
+for result in results:
+
+    print(
+        f"{result['symbol']} — "
+        f"{result['period']}"
+    )
+
+    print(
+        "-" * 80
+    )
+
+
+    if not result["trade_details"]:
+
+        print(
+            "  SIN OPERACIONES"
+        )
+
+        print()
+
+        continue
+
+
+    for number, trade in enumerate(
+        result["trade_details"],
+        start=1
+    ):
+
+        entry_date = trade[
+            "entry_date"
+        ]
+
+        exit_date = trade[
+            "exit_date"
+        ]
+
+
+        if hasattr(
+            entry_date,
+            "strftime"
+        ):
+
+            entry_date_text = (
+                entry_date.strftime(
+                    "%Y-%m-%d"
+                )
+            )
+
+        else:
+
+            entry_date_text = str(
+                entry_date
+            )
+
+
+        if hasattr(
+            exit_date,
+            "strftime"
+        ):
+
+            exit_date_text = (
+                exit_date.strftime(
+                    "%Y-%m-%d"
+                )
+            )
+
+        else:
+
+            exit_date_text = str(
+                exit_date
+            )
+
+
+        print(
+            f"  TRADE #{number}"
+        )
+
+        print(
+            f"    Entrada:       "
+            f"{entry_date_text}"
+        )
+
+        print(
+            f"    Precio entrada:"
+            f" ${trade['entry_price']:,.4f}"
+        )
+
+        print(
+            f"    Stop inicial:  "
+            f"${trade['stop_price']:,.4f}"
+        )
+
+        print(
+            f"    Acciones:      "
+            f"{trade['shares']}"
+        )
+
+        print(
+            f"    Salida:        "
+            f"{exit_date_text}"
+        )
+
+        print(
+            f"    Precio salida: "
+            f"${trade['exit_price']:,.4f}"
+        )
+
+        print(
+            f"    Motivo salida: "
+            f"{trade['exit_reason']}"
+        )
+
+        print(
+            f"    Comisión entrada:"
+            f" ${trade['entry_commission']:,.2f}"
+        )
+
+        print(
+            f"    Comisión salida: "
+            f"${trade['exit_commission']:,.2f}"
+        )
+
+        print(
+            f"    Comisión total: "
+            f"${trade['total_commission']:,.2f}"
+        )
+
+        print(
+            f"    P&L:            "
+            f"${trade['profit_loss']:,.2f}"
+        )
+
+        print(
+            f"    Rendimiento:    "
+            f"{trade['return_percent']:+.2f}%"
+        )
+
+        print()
+
+
+# ============================================================
+# EXPORTAR RESULTADOS PRINCIPALES
 # ============================================================
 
 output_lines = []
 
 output_lines.append(
-    "AI TRADER — MULTI BACKTEST V3"
+    "AI TRADER — MULTI BACKTEST V4"
 )
 
 output_lines.append(
@@ -1636,6 +2030,26 @@ for result in results:
     )
 
     output_lines.append(
+        f"Salidas STOP: "
+        f"{result['stop_count']}"
+    )
+
+    output_lines.append(
+        f"Salidas STOP_GAP: "
+        f"{result['stop_gap_count']}"
+    )
+
+    output_lines.append(
+        f"Salidas EMA: "
+        f"{result['ema_count']}"
+    )
+
+    output_lines.append(
+        f"Cierres finales: "
+        f"{result['final_count']}"
+    )
+
+    output_lines.append(
         f"Sharpe: "
         f"{result['sharpe']:.2f}"
     )
@@ -1662,6 +2076,7 @@ try:
             )
         )
 
+
     print(
         "=============================================="
     )
@@ -1678,6 +2093,7 @@ try:
         "=============================================="
     )
 
+
 except Exception as error:
 
     print(
@@ -1689,12 +2105,227 @@ except Exception as error:
     )
 
 
+# ============================================================
+# EXPORTAR AUDITORÍA
+# ============================================================
+
+trade_output = []
+
+trade_output.append(
+    "AI TRADER — AUDITORIA DE OPERACIONES V4"
+)
+
+trade_output.append(
+    "=============================================="
+)
+
+trade_output.append(
+    "SOLO BACKTEST — NO SE ENVIAN ORDENES"
+)
+
+trade_output.append("")
+
+
+for result in results:
+
+    trade_output.append(
+        f"{result['symbol']} — "
+        f"{result['period']}"
+    )
+
+    trade_output.append(
+        "=" * 80
+    )
+
+
+    if not result["trade_details"]:
+
+        trade_output.append(
+            "SIN OPERACIONES"
+        )
+
+        trade_output.append("")
+
+        continue
+
+
+    for number, trade in enumerate(
+        result["trade_details"],
+        start=1
+    ):
+
+        entry_date = trade[
+            "entry_date"
+        ]
+
+        exit_date = trade[
+            "exit_date"
+        ]
+
+
+        if hasattr(
+            entry_date,
+            "strftime"
+        ):
+
+            entry_date_text = (
+                entry_date.strftime(
+                    "%Y-%m-%d"
+                )
+            )
+
+        else:
+
+            entry_date_text = str(
+                entry_date
+            )
+
+
+        if hasattr(
+            exit_date,
+            "strftime"
+        ):
+
+            exit_date_text = (
+                exit_date.strftime(
+                    "%Y-%m-%d"
+                )
+            )
+
+        else:
+
+            exit_date_text = str(
+                exit_date
+            )
+
+
+        trade_output.append(
+            f"TRADE #{number}"
+        )
+
+        trade_output.append(
+            f"Entrada: {entry_date_text}"
+        )
+
+        trade_output.append(
+            f"Precio entrada: "
+            f"${trade['entry_price']:,.4f}"
+        )
+
+        trade_output.append(
+            f"Stop inicial: "
+            f"${trade['stop_price']:,.4f}"
+        )
+
+        trade_output.append(
+            f"Acciones: "
+            f"{trade['shares']}"
+        )
+
+        trade_output.append(
+            f"Valor entrada: "
+            f"${trade['entry_value']:,.2f}"
+        )
+
+        trade_output.append(
+            f"Salida: {exit_date_text}"
+        )
+
+        trade_output.append(
+            f"Precio salida: "
+            f"${trade['exit_price']:,.4f}"
+        )
+
+        trade_output.append(
+            f"Motivo salida: "
+            f"{trade['exit_reason']}"
+        )
+
+        trade_output.append(
+            f"Comisión entrada: "
+            f"${trade['entry_commission']:,.2f}"
+        )
+
+        trade_output.append(
+            f"Comisión salida: "
+            f"${trade['exit_commission']:,.2f}"
+        )
+
+        trade_output.append(
+            f"Comisión total: "
+            f"${trade['total_commission']:,.2f}"
+        )
+
+        trade_output.append(
+            f"P&L: "
+            f"${trade['profit_loss']:,.2f}"
+        )
+
+        trade_output.append(
+            f"Rendimiento: "
+            f"{trade['return_percent']:+.2f}%"
+        )
+
+        trade_output.append("")
+
+
+try:
+
+    with open(
+        "backtest_trades.txt",
+        "w",
+        encoding="utf-8"
+    ) as file:
+
+        file.write(
+            "\n".join(
+                trade_output
+            )
+        )
+
+
+    print(
+        "AUDITORIA EXPORTADA"
+    )
+
+    print(
+        "Archivo: backtest_trades.txt"
+    )
+
+
+except Exception as error:
+
+    print(
+        "ERROR AL EXPORTAR AUDITORIA"
+    )
+
+    print(
+        error
+    )
+
+
+# ============================================================
+# FINAL
+# ============================================================
+
 print()
 
 print(
-    "BACKTEST V3 FINALIZADO"
+    "=============================================="
+)
+
+print(
+    "BACKTEST V4 FINALIZADO"
 )
 
 print(
     "NO SE ENVIARON ORDENES."
+)
+
+print(
+    "AUDITORIA DE OPERACIONES GENERADA."
+)
+
+print(
+    "=============================================="
 )
