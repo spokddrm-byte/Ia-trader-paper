@@ -6,14 +6,21 @@ from datetime import datetime, timedelta, timezone
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
+from alpaca.data.enums import DataFeed
 
 
 # ============================================================
-# AI TRADER — MULTI BACKTEST V7
-# AUDITORÍA DE CONTABILIDAD Y RIESGO
+# AI TRADER — MULTI BACKTEST V7.1
+# AUDITORÍA + FUENTE IEX
 # ============================================================
 
-SYMBOLS = ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL"]
+SYMBOLS = [
+    "AAPL",
+    "MSFT",
+    "NVDA",
+    "AMZN",
+    "GOOGL"
+]
 
 START_CAPITAL = 100000.0
 
@@ -28,8 +35,8 @@ COMMISSION_PER_SHARE = 0.01
 WARMUP_DAYS = 252
 TEST_WINDOW_DAYS = 63
 
-OUTPUT_FILE = "backtest_results_v7.txt"
-TRADE_FILE = "trade_audit_v7.csv"
+OUTPUT_FILE = "backtest_results_v7_1.txt"
+TRADE_FILE = "trade_audit_v7_1.csv"
 
 
 # ============================================================
@@ -41,7 +48,8 @@ SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 
 if not API_KEY or not SECRET_KEY:
     raise RuntimeError(
-        "FALTAN ALPACA_API_KEY O ALPACA_SECRET_KEY EN VARIABLES DE RAILWAY"
+        "FALTAN ALPACA_API_KEY O ALPACA_SECRET_KEY "
+        "EN LAS VARIABLES DE RAILWAY"
     )
 
 client = StockHistoricalDataClient(
@@ -99,19 +107,25 @@ def rsi(values, period=14):
 
     for i in range(period, len(gains)):
         average_gain = (
-            (average_gain * (period - 1))
+            (
+                average_gain * (period - 1)
+            )
             + gains[i]
         ) / period
 
         average_loss = (
-            (average_loss * (period - 1))
+            (
+                average_loss * (period - 1)
+            )
             + losses[i]
         ) / period
 
     if average_loss == 0:
         return 100.0
 
-    relative_strength = average_gain / average_loss
+    relative_strength = (
+        average_gain / average_loss
+    )
 
     return 100 - (
         100 / (1 + relative_strength)
@@ -152,8 +166,10 @@ def calculate_profit_factor(trades):
             gross_loss += abs(pnl)
 
     if gross_loss == 0:
+
         if gross_profit > 0:
             return float("inf")
+
         return 0.0
 
     return gross_profit / gross_loss
@@ -178,21 +194,33 @@ def calculate_max_drawdown(equity_curve):
 
     peak = equity_curve[0]
     max_drawdown = 0.0
+    max_drawdown_amount = 0.0
 
     for equity in equity_curve:
+
         if equity > peak:
             peak = equity
 
         if peak > 0:
+
             drawdown = (
-                (peak - equity) / peak
+                (peak - equity)
+                / peak
+            )
+
+            drawdown_amount = (
+                peak - equity
             )
 
             if drawdown > max_drawdown:
                 max_drawdown = drawdown
 
-    return max_drawdown, max_drawdown * (
-        equity_curve[0]
+            if drawdown_amount > max_drawdown_amount:
+                max_drawdown_amount = drawdown_amount
+
+    return (
+        max_drawdown,
+        max_drawdown_amount
     )
 
 
@@ -203,34 +231,44 @@ def calculate_sharpe(equity_curve):
     returns = []
 
     for i in range(1, len(equity_curve)):
+
         previous = equity_curve[i - 1]
 
         if previous <= 0:
             continue
 
         daily_return = (
-            equity_curve[i] / previous
+            equity_curve[i]
+            / previous
         ) - 1
 
-        returns.append(daily_return)
+        returns.append(
+            daily_return
+        )
 
     if len(returns) < 2:
         return 0.0
 
-    average = sum(returns) / len(returns)
+    average = (
+        sum(returns)
+        / len(returns)
+    )
 
     variance = sum(
-        (r - average) ** 2
-        for r in returns
+        (value - average) ** 2
+        for value in returns
     ) / (len(returns) - 1)
 
-    standard_deviation = math.sqrt(variance)
+    standard_deviation = math.sqrt(
+        variance
+    )
 
     if standard_deviation == 0:
         return 0.0
 
     return (
-        average / standard_deviation
+        average
+        / standard_deviation
     ) * math.sqrt(252)
 
 
@@ -245,45 +283,69 @@ def calculate_buy_hold(bars):
         return 0.0
 
     return (
-        (last_price / first_price) - 1
-    )
+        last_price / first_price
+    ) - 1
 
 
 # ============================================================
-# DATOS
+# DATOS ALPACA
 # ============================================================
 
 def get_data(symbol, years):
-    end_date = datetime.now(timezone.utc).date()
+    """
+    IMPORTANTE:
+    Se fuerza DataFeed.IEX porque la suscripción actual
+    no permite consultar datos recientes SIP.
+    """
+
+    end_date = (
+        datetime.now(
+            timezone.utc
+        ).date()
+        - timedelta(days=1)
+    )
 
     start_date = (
         end_date
-        - timedelta(days=int(years * 365.25))
+        - timedelta(
+            days=int(years * 365.25)
+        )
     )
 
     request = StockBarsRequest(
         symbol_or_symbols=symbol,
         timeframe=TimeFrame.Day,
+
         start=datetime.combine(
             start_date,
             datetime.min.time(),
             tzinfo=timezone.utc
         ),
+
         end=datetime.combine(
             end_date + timedelta(days=1),
             datetime.min.time(),
             tzinfo=timezone.utc
         ),
-        adjustment="all"
+
+        adjustment="all",
+
+        # ====================================================
+        # CORRECCIÓN V7.1
+        # ====================================================
+        feed=DataFeed.IEX
     )
 
-    response = client.get_stock_bars(request)
+    response = client.get_stock_bars(
+        request
+    )
 
     bars = response[symbol]
 
     cleaned = []
 
     for bar in bars:
+
         cleaned.append(
             {
                 "date": bar.timestamp.date(),
@@ -295,14 +357,14 @@ def get_data(symbol, years):
         )
 
     cleaned.sort(
-        key=lambda x: x["date"]
+        key=lambda item: item["date"]
     )
 
     return cleaned
 
 
 # ============================================================
-# POSICIÓN
+# POSITION SIZE
 # ============================================================
 
 def calculate_position_size(
@@ -314,29 +376,38 @@ def calculate_position_size(
         return 0
 
     risk_amount = (
-        equity * RISK_PER_TRADE
+        equity
+        * RISK_PER_TRADE
     )
 
     risk_per_share = abs(
-        entry_price - stop_price
+        entry_price
+        - stop_price
     )
 
     if risk_per_share <= 0:
         return 0
 
     shares = int(
-        risk_amount / risk_per_share
+        risk_amount
+        / risk_per_share
     )
 
-    return max(shares, 0)
+    return max(
+        shares,
+        0
+    )
 
 
 # ============================================================
-# BACKTEST CONTINUO
+# BACKTEST
 # ============================================================
 
 def run_backtest(symbol, bars):
-    if len(bars) <= WARMUP_DAYS + 20:
+
+    if len(bars) <= (
+        WARMUP_DAYS + 20
+    ):
         return None
 
     warmup = bars[
@@ -368,8 +439,8 @@ def run_backtest(symbol, bars):
 
     audit_errors = []
 
-    daily_trade_count = 0
     current_date = None
+    daily_trade_count = 0
 
     closes = [
         item["close"]
@@ -378,13 +449,23 @@ def run_backtest(symbol, bars):
 
     all_bars = []
 
-    all_bars.extend(warmup)
-    all_bars.extend(test_bars)
+    all_bars.extend(
+        warmup
+    )
+
+    all_bars.extend(
+        test_bars
+    )
+
+    # ========================================================
+    # LOOP PRINCIPAL
+    # ========================================================
 
     for index in range(
         WARMUP_DAYS,
         len(all_bars)
     ):
+
         bar = all_bars[index]
 
         date = bar["date"]
@@ -395,37 +476,52 @@ def run_backtest(symbol, bars):
         close_price = bar["close"]
 
         if current_date != date:
+
             current_date = date
             daily_trade_count = 0
 
-        # ----------------------------------------------------
-        # EJECUTAR ENTRADA PENDIENTE
-        # ----------------------------------------------------
+        # ====================================================
+        # ENTRADA PENDIENTE
+        # ====================================================
 
-        if pending_entry and shares == 0:
+        if (
+            pending_entry
+            and shares == 0
+        ):
 
-            if daily_trade_count >= MAX_TRADES_PER_DAY:
+            if (
+                daily_trade_count
+                >= MAX_TRADES_PER_DAY
+            ):
+
                 pending_entry = False
 
             else:
+
                 actual_entry = (
                     open_price
-                    * (1 + SLIPPAGE_RATE)
+                    * (
+                        1
+                        + SLIPPAGE_RATE
+                    )
                 )
 
                 actual_stop = (
                     actual_entry
-                    * (1 - STOP_PERCENT)
+                    * (
+                        1
+                        - STOP_PERCENT
+                    )
                 )
 
-                equity_before = (
-                    cash
-                )
+                equity_before = cash
 
-                position_size = calculate_position_size(
-                    equity_before,
-                    actual_entry,
-                    actual_stop
+                position_size = (
+                    calculate_position_size(
+                        equity_before,
+                        actual_entry,
+                        actual_stop
+                    )
                 )
 
                 if position_size > 0:
@@ -435,28 +531,40 @@ def run_backtest(symbol, bars):
                         * position_size
                     )
 
-                    commission = (
+                    entry_commission = (
                         position_size
                         * COMMISSION_PER_SHARE
                     )
 
-                    if (
+                    required_cash = (
                         total_cost
-                        + commission
+                        + entry_commission
+                    )
+
+                    if (
+                        required_cash
                         <= cash
                     ):
 
-                        cash -= (
-                            total_cost
-                            + commission
+                        cash -= required_cash
+
+                        shares = (
+                            position_size
                         )
 
-                        shares = position_size
+                        entry_price = (
+                            actual_entry
+                        )
 
-                        entry_price = actual_entry
                         entry_date = date
-                        signal_date = pending_signal_date
-                        stop_price = actual_stop
+
+                        signal_date = (
+                            pending_signal_date
+                        )
+
+                        stop_price = (
+                            actual_stop
+                        )
 
                         position_equity_at_entry = (
                             equity_before
@@ -467,47 +575,63 @@ def run_backtest(symbol, bars):
                         pending_entry = False
 
                     else:
+
                         pending_entry = False
 
                 else:
+
                     pending_entry = False
 
-        # ----------------------------------------------------
-        # GESTIONAR POSICIÓN
-        # ----------------------------------------------------
+        # ====================================================
+        # GESTIÓN DE POSICIÓN
+        # ====================================================
 
         if shares > 0:
 
             exit_price = None
             exit_reason = None
 
+            # ------------------------------------------------
             # GAP
+            # ------------------------------------------------
+
             if open_price <= stop_price:
 
                 exit_price = (
                     open_price
-                    * (1 - SLIPPAGE_RATE)
+                    * (
+                        1
+                        - SLIPPAGE_RATE
+                    )
                 )
 
-                exit_reason = "STOP_GAP"
+                exit_reason = (
+                    "STOP_GAP"
+                )
 
+            # ------------------------------------------------
             # STOP INTRADÍA
+            # ------------------------------------------------
+
             elif low_price <= stop_price:
 
                 exit_price = (
                     stop_price
-                    * (1 - SLIPPAGE_RATE)
+                    * (
+                        1
+                        - SLIPPAGE_RATE
+                    )
                 )
 
-                exit_reason = "STOP"
+                exit_reason = (
+                    "STOP"
+                )
 
             else:
 
                 historical_closes = (
                     closes
-                    + [
-                        close_price
-                    ]
+                    + [close_price]
                 )
 
                 ema20 = ema(
@@ -522,13 +646,18 @@ def run_backtest(symbol, bars):
 
                     exit_price = (
                         close_price
-                        * (1 - SLIPPAGE_RATE)
+                        * (
+                            1
+                            - SLIPPAGE_RATE
+                        )
                     )
 
-                    exit_reason = "EMA"
+                    exit_reason = (
+                        "EMA"
+                    )
 
             # ------------------------------------------------
-            # CERRAR
+            # CIERRE
             # ------------------------------------------------
 
             if exit_price is not None:
@@ -543,9 +672,19 @@ def run_backtest(symbol, bars):
                     * COMMISSION_PER_SHARE
                 )
 
+                entry_commission = (
+                    shares
+                    * COMMISSION_PER_SHARE
+                )
+
+                total_commission = (
+                    entry_commission
+                    + exit_commission
+                )
+
                 net_pnl = (
                     gross_pnl
-                    - exit_commission
+                    - total_commission
                 )
 
                 cash += (
@@ -553,7 +692,9 @@ def run_backtest(symbol, bars):
                     * shares
                 )
 
-                cash -= exit_commission
+                cash -= (
+                    exit_commission
+                )
 
                 equity_after = cash
 
@@ -565,13 +706,14 @@ def run_backtest(symbol, bars):
                     * shares
                 )
 
-                actual_risk_pct = 0.0
+                planned_risk_pct = 0.0
 
                 if (
                     position_equity_at_entry
                     > 0
                 ):
-                    actual_risk_pct = (
+
+                    planned_risk_pct = (
                         planned_risk
                         / position_equity_at_entry
                     )
@@ -587,26 +729,19 @@ def run_backtest(symbol, bars):
                     "shares": shares,
                     "exit_reason": exit_reason,
                     "gross_pnl": gross_pnl,
-                    "entry_commission": (
-                        shares
-                        * COMMISSION_PER_SHARE
-                    ),
+                    "entry_commission": entry_commission,
                     "exit_commission": exit_commission,
-                    "total_commission": (
-                        shares
-                        * COMMISSION_PER_SHARE
-                        * 2
-                    ),
+                    "total_commission": total_commission,
                     "net_pnl": net_pnl,
                     "planned_risk": planned_risk,
-                    "planned_risk_pct": actual_risk_pct,
-                    "equity_before": (
-                        position_equity_at_entry
-                    ),
+                    "planned_risk_pct": planned_risk_pct,
+                    "equity_before": position_equity_at_entry,
                     "equity_after": equity_after,
                 }
 
-                trades.append(trade)
+                trades.append(
+                    trade
+                )
 
                 shares = 0
 
@@ -616,17 +751,18 @@ def run_backtest(symbol, bars):
                 stop_price = None
                 position_equity_at_entry = None
 
-        # ----------------------------------------------------
-        # SEÑAL PARA MAÑANA
-        # ----------------------------------------------------
+        # ====================================================
+        # SEÑAL
+        # ====================================================
 
-        if shares == 0 and not pending_entry:
+        if (
+            shares == 0
+            and not pending_entry
+        ):
 
             historical_closes = (
                 closes
-                + [
-                    close_price
-                ]
+                + [close_price]
             )
 
             ema20 = ema(
@@ -650,11 +786,14 @@ def run_backtest(symbol, bars):
                 ):
 
                     pending_entry = True
-                    pending_signal_date = date
 
-        # ----------------------------------------------------
+                    pending_signal_date = (
+                        date
+                    )
+
+        # ====================================================
         # EQUITY REAL
-        # ----------------------------------------------------
+        # ====================================================
 
         market_value = (
             shares
@@ -667,8 +806,15 @@ def run_backtest(symbol, bars):
         )
 
         if total_equity < 0:
+
             audit_errors.append(
                 f"{date}: EQUITY NEGATIVA"
+            )
+
+        if cash < -0.01:
+
+            audit_errors.append(
+                f"{date}: CASH NEGATIVO"
             )
 
         equity_curve.append(
@@ -684,7 +830,7 @@ def run_backtest(symbol, bars):
         )
 
     # ========================================================
-    # CERRAR POSICIÓN FINAL
+    # CIERRE FINAL
     # ========================================================
 
     if shares > 0:
@@ -693,7 +839,10 @@ def run_backtest(symbol, bars):
 
         final_price = (
             final_bar["close"]
-            * (1 - SLIPPAGE_RATE)
+            * (
+                1
+                - SLIPPAGE_RATE
+            )
         )
 
         gross_pnl = (
@@ -706,9 +855,19 @@ def run_backtest(symbol, bars):
             * COMMISSION_PER_SHARE
         )
 
+        entry_commission = (
+            shares
+            * COMMISSION_PER_SHARE
+        )
+
+        total_commission = (
+            entry_commission
+            + exit_commission
+        )
+
         net_pnl = (
             gross_pnl
-            - exit_commission
+            - total_commission
         )
 
         cash += (
@@ -726,10 +885,14 @@ def run_backtest(symbol, bars):
             * shares
         )
 
-        risk_pct = 0.0
+        planned_risk_pct = 0.0
 
-        if position_equity_at_entry > 0:
-            risk_pct = (
+        if (
+            position_equity_at_entry
+            > 0
+        ):
+
+            planned_risk_pct = (
                 planned_risk
                 / position_equity_at_entry
             )
@@ -746,22 +909,13 @@ def run_backtest(symbol, bars):
                 "shares": shares,
                 "exit_reason": "END",
                 "gross_pnl": gross_pnl,
-                "entry_commission": (
-                    shares
-                    * COMMISSION_PER_SHARE
-                ),
+                "entry_commission": entry_commission,
                 "exit_commission": exit_commission,
-                "total_commission": (
-                    shares
-                    * COMMISSION_PER_SHARE
-                    * 2
-                ),
+                "total_commission": total_commission,
                 "net_pnl": net_pnl,
                 "planned_risk": planned_risk,
-                "planned_risk_pct": risk_pct,
-                "equity_before": (
-                    position_equity_at_entry
-                ),
+                "planned_risk_pct": planned_risk_pct,
+                "equity_before": position_equity_at_entry,
                 "equity_after": cash,
             }
         )
@@ -776,16 +930,18 @@ def run_backtest(symbol, bars):
 
     for trade in trades:
 
-        risk_pct = trade[
-            "planned_risk_pct"
-        ]
+        risk_pct = (
+            trade["planned_risk_pct"]
+        )
 
         if risk_pct > max_risk_pct:
             max_risk_pct = risk_pct
 
         if risk_pct > (
-            RISK_PER_TRADE + 0.001
+            RISK_PER_TRADE
+            + 0.001
         ):
+
             audit_errors.append(
                 (
                     f"{trade['entry_date']}: "
@@ -795,16 +951,7 @@ def run_backtest(symbol, bars):
             )
 
     # ========================================================
-    # AUDITORÍA DE CASH
-    # ========================================================
-
-    if cash < -0.01:
-        audit_errors.append(
-            "CASH FINAL NEGATIVO"
-        )
-
-    # ========================================================
-    # VENTANAS 63 DÍAS
+    # VENTANAS DE 63 DÍAS
     # ========================================================
 
     windows = []
@@ -823,13 +970,17 @@ def run_backtest(symbol, bars):
             total_points
         )
 
-        window_equity = equity_curve[
-            window_start:window_end
-        ]
+        window_equity = (
+            equity_curve[
+                window_start:window_end
+            ]
+        )
 
-        window_dates = equity_dates[
-            window_start:window_end
-        ]
+        window_dates = (
+            equity_dates[
+                window_start:window_end
+            ]
+        )
 
         if len(window_equity) < 2:
             break
@@ -842,30 +993,39 @@ def run_backtest(symbol, bars):
             window_equity[-1]
         )
 
-        if starting_equity <= 0:
-            window_return = 0.0
-        else:
+        if starting_equity > 0:
+
             window_return = (
                 ending_equity
                 / starting_equity
             ) - 1
 
-        window_trades = []
+        else:
 
-        start_date = window_dates[0]
-        end_date = window_dates[-1]
+            window_return = 0.0
+
+        start_date = (
+            window_dates[0]
+        )
+
+        end_date = (
+            window_dates[-1]
+        )
+
+        window_trades = []
 
         for trade in trades:
 
-            exit_date = trade[
-                "exit_date"
-            ]
+            exit_date = (
+                trade["exit_date"]
+            )
 
             if (
                 start_date
                 <= exit_date
                 <= end_date
             ):
+
                 window_trades.append(
                     trade
                 )
@@ -891,10 +1051,12 @@ def run_backtest(symbol, bars):
             }
         )
 
-        window_start = window_end
+        window_start = (
+            window_end
+        )
 
     # ========================================================
-    # MÉTRICAS FINALES
+    # MÉTRICAS
     # ========================================================
 
     initial_equity = (
@@ -909,10 +1071,16 @@ def run_backtest(symbol, bars):
         else START_CAPITAL
     )
 
-    total_return = (
-        final_equity
-        / initial_equity
-    ) - 1
+    if initial_equity > 0:
+
+        total_return = (
+            final_equity
+            / initial_equity
+        ) - 1
+
+    else:
+
+        total_return = 0.0
 
     buy_hold = calculate_buy_hold(
         test_bars
@@ -945,10 +1113,6 @@ def run_backtest(symbol, bars):
         for trade in trades
     )
 
-    # ========================================================
-    # AUDITORÍA DE VENTANAS
-    # ========================================================
-
     suspicious_windows = []
 
     for number, window in enumerate(
@@ -956,19 +1120,16 @@ def run_backtest(symbol, bars):
         start=1
     ):
 
-        window_return = (
+        if abs(
             window["return"]
-        )
+        ) > 0.10:
 
-        # No es un error automático.
-        # Solamente marca ventanas
-        # extraordinarias para revisión.
-
-        if abs(window_return) > 0.10:
             suspicious_windows.append(
                 {
                     "number": number,
-                    "return": window_return,
+                    "return": window[
+                        "return"
+                    ],
                     "start": window[
                         "start_date"
                     ],
@@ -1000,7 +1161,7 @@ def run_backtest(symbol, bars):
 
 
 # ============================================================
-# CSV
+# GUARDAR TRADES
 # ============================================================
 
 def save_trades(all_results):
@@ -1078,7 +1239,7 @@ def generate_report(results):
     )
 
     lines.append(
-        "       AI TRADER — MULTI BACKTEST V7"
+        "       AI TRADER — MULTI BACKTEST V7.1"
     )
 
     lines.append(
@@ -1087,6 +1248,10 @@ def generate_report(results):
 
     lines.append(
         "AUDITORÍA DE CONTABILIDAD Y RIESGO"
+    )
+
+    lines.append(
+        "FUENTE DE DATOS: IEX"
     )
 
     lines.append(
@@ -1125,14 +1290,12 @@ def generate_report(results):
 
     for result in results:
 
-        symbol = result["symbol"]
-
         lines.append(
             "=============================================="
         )
 
         lines.append(
-            f"{symbol}"
+            result["symbol"]
         )
 
         lines.append(
@@ -1169,7 +1332,9 @@ def generate_report(results):
             f"{result['win_rate'] * 100:.2f}%"
         )
 
-        pf = result["profit_factor"]
+        pf = result[
+            "profit_factor"
+        ]
 
         if math.isinf(pf):
             pf_text = "INF"
@@ -1177,7 +1342,8 @@ def generate_report(results):
             pf_text = f"{pf:.2f}"
 
         lines.append(
-            f"Profit Factor: {pf_text}"
+            f"Profit Factor: "
+            f"{pf_text}"
         )
 
         lines.append(
@@ -1221,9 +1387,14 @@ def generate_report(results):
                 )
             )
 
-            if math.isinf(window_pf):
+            if math.isinf(
+                window_pf
+            ):
+
                 window_pf_text = "INF"
+
             else:
+
                 window_pf_text = (
                     f"{window_pf:.2f}"
                 )
@@ -1252,7 +1423,9 @@ def generate_report(results):
             "----- AUDITORÍA -----"
         )
 
-        if not result["audit_errors"]:
+        if not result[
+            "audit_errors"
+        ]:
 
             lines.append(
                 "AUDITORÍA: OK"
@@ -1317,7 +1490,7 @@ def main():
     )
 
     print(
-        "       AI TRADER — MULTI BACKTEST V7"
+        "       AI TRADER — MULTI BACKTEST V7.1"
     )
 
     print(
@@ -1326,6 +1499,10 @@ def main():
 
     print(
         "AUDITORÍA DE CONTABILIDAD Y RIESGO"
+    )
+
+    print(
+        "FUENTE DE DATOS: IEX"
     )
 
     print(
@@ -1385,6 +1562,11 @@ def main():
 
             continue
 
+        print(
+            f"{symbol}: "
+            f"{len(bars)} velas"
+        )
+
         if len(bars) <= (
             WARMUP_DAYS + 20
         ):
@@ -1395,11 +1577,6 @@ def main():
 
             continue
 
-        print(
-            f"{symbol}: "
-            f"{len(bars)} velas"
-        )
-
         result = run_backtest(
             symbol,
             bars
@@ -1408,7 +1585,8 @@ def main():
         if result is None:
 
             print(
-                f"{symbol}: BACKTEST NO DISPONIBLE"
+                f"{symbol}: "
+                f"BACKTEST NO DISPONIBLE"
             )
 
             continue
@@ -1416,6 +1594,15 @@ def main():
         all_results.append(
             result
         )
+
+        pf = result[
+            "profit_factor"
+        ]
+
+        if math.isinf(pf):
+            pf_text = "INF"
+        else:
+            pf_text = f"{pf:.2f}"
 
         print("")
 
@@ -1429,7 +1616,7 @@ def main():
             f"| WIN "
             f"{result['win_rate'] * 100:.1f}% "
             f"| PF "
-            f"{result['profit_factor']:.2f} "
+            f"{pf_text} "
             f"| DD "
             f"{result['max_drawdown'] * 100:.2f}% "
             f"| SHARPE "
@@ -1437,8 +1624,12 @@ def main():
         )
 
         print(
-            f"AUDITORÍA "
-            f"{'OK' if not result['audit_errors'] else 'ERROR'}"
+            "AUDITORÍA "
+            + (
+                "OK"
+                if not result["audit_errors"]
+                else "ERROR"
+            )
         )
 
         print(
@@ -1449,7 +1640,7 @@ def main():
         print("")
 
     # ========================================================
-    # GUARDAR
+    # GUARDAR REPORTE
     # ========================================================
 
     report = generate_report(
@@ -1462,32 +1653,34 @@ def main():
         encoding="utf-8"
     ) as file:
 
-        file.write(report)
+        file.write(
+            report
+        )
 
     save_trades(
         all_results
     )
 
-    print(report)
+    print(
+        "=============================================="
+    )
+
+    print(
+        f"REPORTE GUARDADO: "
+        f"{OUTPUT_FILE}"
+    )
+
+    print(
+        f"TRADES GUARDADOS: "
+        f"{TRADE_FILE}"
+    )
 
     print(
         "=============================================="
     )
 
     print(
-        f"REPORTE GUARDADO: {OUTPUT_FILE}"
-    )
-
-    print(
-        f"TRADES GUARDADOS: {TRADE_FILE}"
-    )
-
-    print(
-        "=============================================="
-    )
-
-    print(
-        "V7 TERMINADO"
+        "V7.1 TERMINADO"
     )
 
 
