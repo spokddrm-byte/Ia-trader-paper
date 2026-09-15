@@ -22,6 +22,7 @@ from alpaca.data.enums import DataFeed
 # - Señal al cierre
 # - Entrada al OPEN del día siguiente
 # - Stop usando LOW real
+# - Stop con protección contra gaps
 # - Slippage
 # - Comisiones
 # - Position sizing por riesgo
@@ -32,7 +33,7 @@ from alpaca.data.enums import DataFeed
 # - CAGR
 # - Sharpe
 # - Rachas de pérdidas
-# - Buy & Hold corregido
+# - Buy & Hold
 # - Exportación a backtest_results.txt
 #
 # IMPORTANTE:
@@ -224,6 +225,18 @@ def clean_bars(symbol_bars):
         if high < low:
             continue
 
+        if high < open_price:
+            continue
+
+        if high < close:
+            continue
+
+        if low > open_price:
+            continue
+
+        if low > close:
+            continue
+
         data.append(
             (
                 timestamp,
@@ -370,7 +383,7 @@ def calculate_sharpe(
 
 
 # ============================================================
-# Racha máxima de pérdidas
+# RACHA MÁXIMA DE PÉRDIDAS
 # ============================================================
 
 def calculate_max_losing_streak(
@@ -462,7 +475,7 @@ def run_backtest(data):
 
     for i in range(
         20,
-        len(closes) - 1
+        len(closes)
     ):
 
         price = closes[i]
@@ -608,10 +621,27 @@ def run_backtest(data):
             # ------------------------------------------------
             # STOP
             #
-            # Usamos LOW real del día.
+            # Si el mercado abre por debajo
+            # del stop, usamos el OPEN.
+            #
+            # Si solamente toca el stop
+            # durante el día, usamos el STOP.
             # ------------------------------------------------
 
-            if lows[i] <= stop_price:
+            if opens[i] <= stop_price:
+
+                exit_reason = "STOP_GAP"
+
+                execution_price = (
+                    opens[i] *
+                    (
+                        1 -
+                        SLIPPAGE_PERCENT
+                    )
+                )
+
+
+            elif lows[i] <= stop_price:
 
                 exit_reason = "STOP"
 
@@ -818,6 +848,12 @@ def run_backtest(data):
         position = 0
 
 
+        # Añadir el capital final a la equity curve
+        equity_curve.append(
+            capital
+        )
+
+
     # ========================================================
     # MÉTRICAS
     # ========================================================
@@ -891,9 +927,6 @@ def run_backtest(data):
 
     # ========================================================
     # BUY & HOLD
-    #
-    # Ahora usamos precios ajustados
-    # por splits/dividendos.
     # ========================================================
 
     first_price = closes[0]
@@ -1078,6 +1111,7 @@ def run_backtest(data):
 
         "commissions":
             total_commissions
+
     }
 
 
@@ -1110,7 +1144,21 @@ print(
 )
 
 print(
-    "STOP: LOW REAL"
+    "STOP: LOW REAL + PROTECCIÓN GAP"
+)
+
+print(
+    "SLIPPAGE + COMISIONES ACTIVOS"
+)
+
+print()
+
+print(
+    "IMPORTANTE: SOLO BACKTEST"
+)
+
+print(
+    "NO SE ENVIAN ORDENES"
 )
 
 print()
@@ -1159,6 +1207,7 @@ for symbol in SYMBOLS:
             feed=DataFeed.IEX,
 
             adjustment="all"
+
         )
 
 
@@ -1427,3 +1476,225 @@ for result in results:
     print(
         f"  Racha máxima de pérdidas: "
         f"{result['max_losing_streak']}"
+    )
+
+    print(
+        f"  Comisiones: "
+        f"${result['commissions']:,.2f}"
+    )
+
+    print(
+        f"  Sharpe: "
+        f"{result['sharpe']:.2f}"
+    )
+
+    print(
+        f"  CAGR: "
+        f"{result['cagr']:.2f}%"
+    )
+
+    print()
+
+
+# ============================================================
+# EXPORTAR RESULTADOS
+# ============================================================
+
+output_lines = []
+
+output_lines.append(
+    "AI TRADER — MULTI BACKTEST V3"
+)
+
+output_lines.append(
+    "=============================================="
+)
+
+output_lines.append(
+    "SOLO BACKTEST — NO SE ENVIAN ORDENES"
+)
+
+output_lines.append("")
+
+output_lines.append(
+    "ACTIVO | PERIODO | ESTRATEGIA | B&H | "
+    "TRADES | WIN% | PF | DD | CAGR | SHARPE"
+)
+
+output_lines.append(
+    "-" * 105
+)
+
+
+for result in results:
+
+    pf = result[
+        "profit_factor"
+    ]
+
+
+    if math.isinf(pf):
+
+        pf_text = "INF"
+
+    else:
+
+        pf_text = (
+            f"{pf:.2f}"
+        )
+
+
+    output_lines.append(
+
+        f"{result['symbol']:6} | "
+
+        f"{result['period']:7} | "
+
+        f"{result['return']:9.2f}% | "
+
+        f"{result['buy_hold']:6.2f}% | "
+
+        f"{result['trades']:6} | "
+
+        f"{result['win_rate']:5.1f}% | "
+
+        f"{pf_text:>4} | "
+
+        f"{result['drawdown']:5.2f}% | "
+
+        f"{result['cagr']:5.2f}% | "
+
+        f"{result['sharpe']:6.2f}"
+
+    )
+
+
+output_lines.append("")
+
+output_lines.append(
+    "DETALLE DE RIESGO"
+)
+
+output_lines.append(
+    "=============================================="
+)
+
+output_lines.append("")
+
+
+for result in results:
+
+    output_lines.append(
+        f"{result['symbol']} — "
+        f"{result['period']}"
+    )
+
+    output_lines.append(
+        f"Capital final: "
+        f"${result['final_capital']:,.2f}"
+    )
+
+    output_lines.append(
+        f"Rendimiento: "
+        f"{result['return']:.2f}%"
+    )
+
+    output_lines.append(
+        f"Buy & Hold: "
+        f"{result['buy_hold']:.2f}%"
+    )
+
+    output_lines.append(
+        f"Diferencia vs B&H: "
+        f"{result['vs_buy_hold']:+.2f}%"
+    )
+
+    output_lines.append(
+        f"Drawdown máximo: "
+        f"{result['drawdown']:.2f}% "
+        f"(${result['drawdown_dollars']:,.2f})"
+    )
+
+    output_lines.append(
+        f"Mejor operación: "
+        f"${result['best_trade']:,.2f}"
+    )
+
+    output_lines.append(
+        f"Peor operación: "
+        f"${result['worst_trade']:,.2f}"
+    )
+
+    output_lines.append(
+        f"Racha máxima de pérdidas: "
+        f"{result['max_losing_streak']}"
+    )
+
+    output_lines.append(
+        f"Comisiones: "
+        f"${result['commissions']:,.2f}"
+    )
+
+    output_lines.append(
+        f"Sharpe: "
+        f"{result['sharpe']:.2f}"
+    )
+
+    output_lines.append(
+        f"CAGR: "
+        f"{result['cagr']:.2f}%"
+    )
+
+    output_lines.append("")
+
+
+try:
+
+    with open(
+        "backtest_results.txt",
+        "w",
+        encoding="utf-8"
+    ) as file:
+
+        file.write(
+            "\n".join(
+                output_lines
+            )
+        )
+
+    print(
+        "=============================================="
+    )
+
+    print(
+        "RESULTADOS EXPORTADOS"
+    )
+
+    print(
+        "Archivo: backtest_results.txt"
+    )
+
+    print(
+        "=============================================="
+    )
+
+except Exception as error:
+
+    print(
+        "ERROR AL EXPORTAR RESULTADOS"
+    )
+
+    print(
+        error
+    )
+
+
+print()
+
+print(
+    "BACKTEST V3 FINALIZADO"
+)
+
+print(
+    "NO SE ENVIARON ORDENES."
+)
