@@ -1,3 +1,4 @@
+import os
 from datetime import datetime, timedelta, timezone
 
 from alpaca.data.historical import StockHistoricalDataClient
@@ -25,8 +26,6 @@ STOP_PERCENT = 0.03
 # CONEXIÓN CON ALPACA
 # =========================
 
-import os
-
 api_key = os.environ["ALPACA_API_KEY"]
 secret_key = os.environ["ALPACA_SECRET_KEY"]
 
@@ -44,7 +43,6 @@ end = datetime.now(timezone.utc)
 
 start = end - timedelta(days=365)
 
-
 request = StockBarsRequest(
     symbol_or_symbols=[SYMBOL],
     timeframe=TimeFrame.Day,
@@ -53,11 +51,9 @@ request = StockBarsRequest(
     feed=DataFeed.IEX
 )
 
-
 bars = data_client.get_stock_bars(request)
 
 symbol_bars = bars[SYMBOL]
-
 
 closes = [
     float(bar.close)
@@ -82,7 +78,7 @@ if len(closes) < 50:
 
 
 # =========================
-# VARIABLES DEL BACKTEST
+# VARIABLES
 # =========================
 
 capital = INITIAL_CAPITAL
@@ -95,13 +91,15 @@ stop_price = 0.0
 
 trades = []
 
+equity_curve = []
+
 wins = 0
 
 losses = 0
 
 
 # =========================
-# RECORRER HISTÓRICO
+# BACKTEST
 # =========================
 
 for i in range(20, len(closes)):
@@ -110,7 +108,6 @@ for i in range(20, len(closes)):
 
     history = closes[:i + 1]
 
-
     # =========================
     # INDICADORES
     # =========================
@@ -118,7 +115,6 @@ for i in range(20, len(closes)):
     ema20 = ema(history, 20)
 
     rsi14 = rsi(history, 14)
-
 
     if ema20 is None or rsi14 is None:
         continue
@@ -153,7 +149,6 @@ for i in range(20, len(closes)):
                 risk_amount / risk_per_share
             )
 
-
             if shares > 0:
 
                 position = shares
@@ -176,7 +171,9 @@ for i in range(20, len(closes)):
 
     else:
 
+        # =========================
         # STOP LOSS
+        # =========================
 
         if price <= stop_price:
 
@@ -184,18 +181,14 @@ for i in range(20, len(closes)):
                 price - entry_price
             ) * position
 
-
             capital += profit_loss
 
-
             trades.append(profit_loss)
-
 
             if profit_loss >= 0:
                 wins += 1
             else:
                 losses += 1
-
 
             print(
                 f"SALIDA STOP | Día {i} | "
@@ -203,7 +196,6 @@ for i in range(20, len(closes)):
                 f"P/L ${profit_loss:.2f}"
             )
 
-
             position = 0
 
             entry_price = 0.0
@@ -211,7 +203,9 @@ for i in range(20, len(closes)):
             stop_price = 0.0
 
 
-        # SALIDA POR CAMBIO DE TENDENCIA
+        # =========================
+        # SALIDA EMA
+        # =========================
 
         elif price < ema20:
 
@@ -219,18 +213,14 @@ for i in range(20, len(closes)):
                 price - entry_price
             ) * position
 
-
             capital += profit_loss
 
-
             trades.append(profit_loss)
-
 
             if profit_loss >= 0:
                 wins += 1
             else:
                 losses += 1
-
 
             print(
                 f"SALIDA EMA | Día {i} | "
@@ -238,104 +228,6 @@ for i in range(20, len(closes)):
                 f"P/L ${profit_loss:.2f}"
             )
 
-
             position = 0
 
-            entry_price = 0.0
-
-            stop_price = 0.0
-
-
-# =========================
-# CERRAR POSICIÓN FINAL
-# =========================
-
-if position > 0:
-
-    final_price = closes[-1]
-
-    profit_loss = (
-        final_price - entry_price
-    ) * position
-
-
-    capital += profit_loss
-
-    trades.append(profit_loss)
-
-
-    if profit_loss >= 0:
-        wins += 1
-    else:
-        losses += 1
-
-
-    print(
-        f"SALIDA FINAL | "
-        f"Precio ${final_price:.2f} | "
-        f"P/L ${profit_loss:.2f}"
-    )
-
-
-# =========================
-# ESTADÍSTICAS
-# =========================
-
-total_trades = len(trades)
-
-if total_trades > 0:
-
-    win_rate = (
-        wins / total_trades
-    ) * 100
-
-else:
-
-    win_rate = 0
-
-
-total_profit = capital - INITIAL_CAPITAL
-
-
-print()
-print("=== RESULTADOS DEL BACKTEST ===")
-
-print(
-    f"Capital inicial: "
-    f"${INITIAL_CAPITAL:.2f}"
-)
-
-print(
-    f"Capital final: "
-    f"${capital:.2f}"
-)
-
-print(
-    f"Resultado: "
-    f"${total_profit:.2f}"
-)
-
-print(
-    f"Operaciones: "
-    f"{total_trades}"
-)
-
-print(
-    f"Ganadoras: "
-    f"{wins}"
-)
-
-print(
-    f"Perdedoras: "
-    f"{losses}"
-)
-
-print(
-    f"Win rate: "
-    f"{win_rate:.2f}%"
-)
-
-print()
-print("=== SEGURIDAD ===")
-print("BACKTEST SOLAMENTE")
-print("NO SE ENVIARON ÓRDENES")
+            entry
