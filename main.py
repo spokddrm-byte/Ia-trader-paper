@@ -26,8 +26,11 @@ from risk_manager import risk_check, calculate_position_size
 from database import (
     initialize_database,
     log_event,
+    update_event,
+    get_event_by_order_id,
     get_today_trade_count,
-    get_today_loss
+    get_today_loss,
+    get_today_profit_loss
 )
 
 
@@ -88,11 +91,13 @@ def main():
 
     trades_today = get_today_trade_count()
     daily_loss = get_today_loss()
+    today_profit_loss = get_today_profit_loss()
 
     print("=== ESTADO DEL BOT ===")
     print(f"Fecha UTC: {datetime.now(timezone.utc).date()}")
     print(f"Operaciones ejecutadas hoy: {trades_today}")
     print(f"Perdida diaria: ${daily_loss:.2f}")
+    print(f"Resultado del dia: ${today_profit_loss:.2f}")
     print()
 
     # =========================
@@ -133,6 +138,8 @@ def main():
         print("=== PROTECCION DE POSICION ===")
         print(f"Ya existe una posicion en {SYMBOL}")
         print(f"Cantidad: {existing_position.qty}")
+        print(f"Precio promedio: ${float(existing_position.avg_entry_price):.2f}")
+        print(f"Ganancia/perdida: ${float(existing_position.unrealized_pl):.2f}")
         print("NO SE ENVIARA OTRA COMPRA")
         print("==============================================")
         return
@@ -240,7 +247,7 @@ def main():
     if signal != "COMPRAR":
         print("=== EJECUCION ===")
         print(f"Señal: {signal}")
-        print("Esta versión solo abre posiciones LONG.")
+        print("Esta version solo abre posiciones LONG.")
         print("NO SE ENVIA NINGUNA ORDEN")
         print("==============================================")
         return
@@ -299,13 +306,17 @@ def main():
     print()
 
     # =========================
-    # ORDEN PAPER
+    # ID DE ORDEN
     # =========================
 
     client_order_id = (
         f"ai-trader-{SYMBOL.lower()}-"
         f"{uuid.uuid4().hex[:12]}"
     )
+
+    # =========================
+    # ORDEN PAPER
+    # =========================
 
     print("=== EJECUCION PAPER ===")
     print("Riesgo aprobado")
@@ -344,24 +355,10 @@ def main():
         return
 
     # =========================
-    # RESULTADO
+    # REGISTRAR ORDEN ENVIADA
     # =========================
 
-    print()
-    print("==============================================")
-    print("ORDEN PAPER ENVIADA")
-    print("==============================================")
-    print(f"ID: {order.id}")
-    print(f"Estado: {order.status}")
-    print(f"Simbolo: {order.symbol}")
-    print(f"Cantidad: {order.qty}")
-    print(f"Lado: {order.side}")
-    print(f"Stop loss: ${stop_price:.2f}")
-    print("==============================================")
-
-    # =========================
-    # DATABASE
-    # =========================
+    order_id = str(order.id)
 
     event_id = log_event(
         symbol=SYMBOL,
@@ -370,15 +367,111 @@ def main():
         stop_price=stop_price,
         position_size=position_size,
         status="ORDER_SUBMITTED",
-        profit_loss=0.0
+        profit_loss=0.0,
+        order_id=order_id,
+        client_order_id=client_order_id
     )
 
     print()
-    print("=== DATABASE ===")
-    print(f"Evento registrado: #{event_id}")
-    print("Estado: ORDER_SUBMITTED")
-    print()
+    print("==============================================")
+    print("ORDEN PAPER ENVIADA")
+    print("==============================================")
+    print(f"Evento DB: #{event_id}")
+    print(f"Order ID: {order.id}")
+    print(f"Estado: {order.status}")
+    print(f"Simbolo: {order.symbol}")
+    print(f"Cantidad: {order.qty}")
+    print(f"Lado: {order.side}")
+    print(f"Stop loss: ${stop_price:.2f}")
+    print(f"Client Order ID: {client_order_id}")
+    print("==============================================")
 
+    # =========================
+    # COMPROBAR ESTADO ACTUAL
+    # =========================
+
+    try:
+
+        updated_order = trading_client.get_order_by_id(
+            order.id
+        )
+
+        order_status = str(updated_order.status).upper()
+
+        print()
+        print("=== VERIFICACION DE ORDEN ===")
+        print(f"Estado actual: {order_status}")
+
+        if order_status == "FILLED":
+
+            filled_price = (
+                float(updated_order.filled_avg_price)
+                if updated_order.filled_avg_price
+                else current_price
+            )
+
+            filled_qty = (
+                int(float(updated_order.filled_qty))
+                if updated_order.filled_qty
+                else position_size
+            )
+
+            update_event(
+                event_id=event_id,
+                status="FILLED",
+                order_id=order_id,
+                client_order_id=client_order_id
+            )
+
+            print(f"Precio ejecutado: ${filled_price:.2f}")
+            print(f"Cantidad ejecutada: {filled_qty}")
+            print("DATABASE: FILLED")
+
+        elif order_status in [
+            "CANCELED",
+            "EXPIRED",
+            "REJECTED"
+        ]:
+
+            update_event(
+                event_id=event_id,
+                status=order_status,
+                order_id=order_id,
+                client_order_id=client_order_id
+            )
+
+            print(f"DATABASE: {order_status}")
+            print("La orden NO quedo abierta.")
+
+        else:
+
+            print("La orden aun no tiene estado final.")
+            print("DATABASE: ORDER_SUBMITTED")
+
+    except Exception as error:
+
+        print()
+        print("NO SE PUDO VERIFICAR EL ESTADO DE LA ORDEN")
+        print(str(error))
+        print("La orden original permanece registrada.")
+
+    # =========================
+    # RESULTADO FINAL
+    # =========================
+
+    print()
+    print("=== DATABASE ===")
+
+    saved_event = get_event_by_order_id(order_id)
+
+    if saved_event:
+        print(f"Evento encontrado: #{saved_event['id']}")
+        print(f"Estado: {saved_event['status']}")
+        print(f"Order ID: {saved_event['order_id']}")
+    else:
+        print("No se encontro el evento en la base de datos.")
+
+    print()
     print("=== SEGURIDAD ===")
     print("ORDEN ENVIADA SOLAMENTE A ALPACA PAPER")
     print("NO ES DINERO REAL")
