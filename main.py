@@ -9,17 +9,21 @@ from alpaca.data.enums import DataFeed
 
 from indicators import sma, ema, rsi, volatility
 from risk_manager import risk_check
-from bot_state import BotState
-from trade_log import log_event
+from database import (
+    initialize_database,
+    log_event,
+    get_today_trade_count,
+    get_today_loss
+)
 
 
 def main():
+
     # =========================
-    # ESTADO DEL BOT
+    # BASE DE DATOS
     # =========================
 
-    state = BotState()
-    state.reset_if_new_day()
+    initialize_database()
 
     # =========================
     # CONEXION CON ALPACA
@@ -50,16 +54,17 @@ def main():
     print("ORDENES: DESACTIVADAS")
 
     # =========================
-    # ESTADO ACTUAL
+    # ESTADO DEL BOT
     # =========================
 
-    status = state.get_status()
+    trades_today = get_today_trade_count()
+    daily_loss = get_today_loss()
 
     print()
     print("=== ESTADO DEL BOT ===")
-    print(f"Fecha: {status['date']}")
-    print(f"Operaciones hoy: {status['trades_today']}")
-    print(f"Perdida diaria: ${status['daily_loss']:.2f}")
+    print(f"Fecha UTC: {datetime.now(timezone.utc).date()}")
+    print(f"Operaciones ejecutadas hoy: {trades_today}")
+    print(f"Perdida diaria: ${daily_loss:.2f}")
 
     # =========================
     # DATOS DEL MERCADO
@@ -129,7 +134,7 @@ def main():
     print(f"Señal generada: {signal}")
 
     # =========================
-    # STOP LOSS DE PRUEBA
+    # STOP LOSS
     # =========================
 
     if signal == "COMPRAR":
@@ -156,18 +161,21 @@ def main():
         account_value=account_value,
         entry_price=current_price,
         stop_price=stop_price,
-        daily_loss=status["daily_loss"],
-        trades_today=status["trades_today"]
+        daily_loss=daily_loss,
+        trades_today=trades_today
     )
 
     print(f"Autorizacion: {approved}")
     print(message)
 
     # =========================
-    # REGISTRO DEL ANALISIS
+    # BASE DE DATOS
     # =========================
 
-    log_event(
+    print()
+    print("=== DATABASE ===")
+
+    event_id = log_event(
         symbol="AAPL",
         signal=signal,
         entry_price=current_price,
@@ -177,9 +185,7 @@ def main():
         profit_loss=0.0
     )
 
-    print()
-    print("=== TRADE LOG ===")
-    print("Analisis registrado correctamente")
+    print(f"Analisis registrado en base de datos: #{event_id}")
     print("Estado: SIGNAL_ONLY")
     print("No cuenta como operacion ejecutada")
 
@@ -202,12 +208,13 @@ def main():
     # ESTADO FINAL
     # =========================
 
-    final_status = state.get_status()
+    final_trades = get_today_trade_count()
+    final_loss = get_today_loss()
 
     print()
     print("=== ESTADO FINAL ===")
-    print(f"Operaciones hoy: {final_status['trades_today']}")
-    print(f"Perdida diaria: ${final_status['daily_loss']:.2f}")
+    print(f"Operaciones ejecutadas hoy: {final_trades}")
+    print(f"Perdida diaria: ${final_loss:.2f}")
 
     print()
     print("=== FIN DEL ANALISIS ===")
