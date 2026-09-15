@@ -1,1 +1,1 @@
-web: python multi_backtest.py
+web: python paper_test.py
