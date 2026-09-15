@@ -1,53 +1,52 @@
-import os
+import csv
 import math
+import os
 from datetime import datetime, timedelta, timezone
 
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
-from alpaca.data.enums import DataFeed
 
 
 # ============================================================
-# AI TRADER — MULTI BACKTEST V6
-# WALK-FORWARD REAL / ROLLING OUT-OF-SAMPLE
-# SOLO BACKTEST — NO ENVIA ORDENES
+# AI TRADER — MULTI BACKTEST V7
+# AUDITORÍA DE CONTABILIDAD Y RIESGO
 # ============================================================
 
 SYMBOLS = ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL"]
 
-PERIODS = {
-    "1 AÑO": 365,
-    "3 AÑOS": 1095,
-    "5 AÑOS": 1825,
-}
-
-INITIAL_CAPITAL = 100000.0
+START_CAPITAL = 100000.0
 
 RISK_PER_TRADE = 0.01
 STOP_PERCENT = 0.03
 
-SLIPPAGE_PERCENT = 0.0005
+MAX_TRADES_PER_DAY = 5
+
+SLIPPAGE_RATE = 0.0005
 COMMISSION_PER_SHARE = 0.01
 
-# Días iniciales necesarios para que los indicadores
-# tengan suficiente historial.
 WARMUP_DAYS = 252
-
-# Cada bloque OOS tendrá aproximadamente 63 días.
 TEST_WINDOW_DAYS = 63
+
+OUTPUT_FILE = "backtest_results_v7.txt"
+TRADE_FILE = "trade_audit_v7.csv"
 
 
 # ============================================================
 # ALPACA
 # ============================================================
 
-api_key = os.environ["ALPACA_API_KEY"]
-secret_key = os.environ["ALPACA_SECRET_KEY"]
+API_KEY = os.getenv("ALPACA_API_KEY")
+SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 
-data_client = StockHistoricalDataClient(
-    api_key,
-    secret_key
+if not API_KEY or not SECRET_KEY:
+    raise RuntimeError(
+        "FALTAN ALPACA_API_KEY O ALPACA_SECRET_KEY EN VARIABLES DE RAILWAY"
+    )
+
+client = StockHistoricalDataClient(
+    API_KEY,
+    SECRET_KEY
 )
 
 
@@ -55,20 +54,24 @@ data_client = StockHistoricalDataClient(
 # INDICADORES
 # ============================================================
 
+def sma(values, period):
+    if len(values) < period:
+        return None
+
+    return sum(values[-period:]) / period
+
+
 def ema(values, period):
     if len(values) < period:
         return None
 
     multiplier = 2 / (period + 1)
 
-    average = sum(
-        values[:period]
-    ) / period
+    average = sum(values[:period]) / period
 
     for price in values[period:]:
         average = (
-            (price - average)
-            * multiplier
+            (price - average) * multiplier
         ) + average
 
     return average
@@ -82,1491 +85,1411 @@ def rsi(values, period=14):
     losses = []
 
     for i in range(1, len(values)):
-
-        change = (
-            values[i]
-            - values[i - 1]
-        )
+        change = values[i] - values[i - 1]
 
         if change > 0:
             gains.append(change)
-            losses.append(0.0)
-
+            losses.append(0)
         else:
-            gains.append(0.0)
+            gains.append(0)
             losses.append(abs(change))
 
-    average_gain = (
-        sum(gains[:period])
-        / period
-    )
+    average_gain = sum(gains[:period]) / period
+    average_loss = sum(losses[:period]) / period
 
-    average_loss = (
-        sum(losses[:period])
-        / period
-    )
-
-    for i in range(
-        period,
-        len(gains)
-    ):
-
+    for i in range(period, len(gains)):
         average_gain = (
-            (
-                average_gain
-                * (period - 1)
-                + gains[i]
-            )
-            / period
-        )
+            (average_gain * (period - 1))
+            + gains[i]
+        ) / period
 
         average_loss = (
-            (
-                average_loss
-                * (period - 1)
-                + losses[i]
-            )
-            / period
-        )
+            (average_loss * (period - 1))
+            + losses[i]
+        ) / period
 
     if average_loss == 0:
         return 100.0
 
-    relative_strength = (
-        average_gain
-        / average_loss
-    )
+    relative_strength = average_gain / average_loss
 
-    return 100.0 - (
-        100.0
-        / (1.0 + relative_strength)
+    return 100 - (
+        100 / (1 + relative_strength)
     )
 
 
+def volatility(values, period=20):
+    if len(values) < period:
+        return None
+
+    recent = values[-period:]
+
+    average = sum(recent) / period
+
+    variance = sum(
+        (price - average) ** 2
+        for price in recent
+    ) / period
+
+    return math.sqrt(variance)
+
+
 # ============================================================
-# LIMPIEZA DE DATOS
+# MÉTRICAS
 # ============================================================
 
-def clean_bars(symbol_bars):
+def calculate_profit_factor(trades):
+    gross_profit = 0.0
+    gross_loss = 0.0
 
-    data = []
+    for trade in trades:
+        pnl = trade["net_pnl"]
 
-    for bar in symbol_bars:
+        if pnl > 0:
+            gross_profit += pnl
 
-        timestamp = bar.timestamp
+        elif pnl < 0:
+            gross_loss += abs(pnl)
 
-        open_price = float(bar.open)
-        high = float(bar.high)
-        low = float(bar.low)
-        close = float(bar.close)
+    if gross_loss == 0:
+        if gross_profit > 0:
+            return float("inf")
+        return 0.0
 
-        if (
-            open_price <= 0
-            or high <= 0
-            or low <= 0
-            or close <= 0
-        ):
-            continue
+    return gross_profit / gross_loss
 
-        if high < low:
-            continue
 
-        if high < open_price:
-            continue
+def calculate_win_rate(trades):
+    if not trades:
+        return 0.0
 
-        if high < close:
-            continue
-
-        if low > open_price:
-            continue
-
-        if low > close:
-            continue
-
-        data.append(
-            (
-                timestamp,
-                open_price,
-                high,
-                low,
-                close
-            )
-        )
-
-    data.sort(
-        key=lambda item: item[0]
+    wins = sum(
+        1
+        for trade in trades
+        if trade["net_pnl"] > 0
     )
 
-    return data
+    return wins / len(trades)
 
 
-# ============================================================
-# METRICAS
-# ============================================================
-
-def max_drawdown(equity):
-
-    if not equity:
+def calculate_max_drawdown(equity_curve):
+    if not equity_curve:
         return 0.0, 0.0
 
-    peak = equity[0]
+    peak = equity_curve[0]
+    max_drawdown = 0.0
 
-    max_dd = 0.0
-    max_dd_percent = 0.0
+    for equity in equity_curve:
+        if equity > peak:
+            peak = equity
 
-    for value in equity:
+        if peak > 0:
+            drawdown = (
+                (peak - equity) / peak
+            )
 
-        if value > peak:
-            peak = value
+            if drawdown > max_drawdown:
+                max_drawdown = drawdown
 
-        if peak <= 0:
-            continue
-
-        drawdown = (
-            peak - value
-        )
-
-        drawdown_percent = (
-            drawdown
-            / peak
-            * 100.0
-        )
-
-        max_dd = max(
-            max_dd,
-            drawdown
-        )
-
-        max_dd_percent = max(
-            max_dd_percent,
-            drawdown_percent
-        )
-
-    return (
-        max_dd,
-        max_dd_percent
+    return max_drawdown, max_drawdown * (
+        equity_curve[0]
     )
 
 
-def sharpe(equity):
-
-    if len(equity) < 2:
+def calculate_sharpe(equity_curve):
+    if len(equity_curve) < 3:
         return 0.0
 
     returns = []
 
-    for i in range(
-        1,
-        len(equity)
-    ):
-
-        previous = equity[i - 1]
-        current = equity[i]
+    for i in range(1, len(equity_curve)):
+        previous = equity_curve[i - 1]
 
         if previous <= 0:
             continue
 
         daily_return = (
-            current - previous
-        ) / previous
+            equity_curve[i] / previous
+        ) - 1
 
-        returns.append(
-            daily_return
-        )
+        returns.append(daily_return)
 
     if len(returns) < 2:
         return 0.0
 
-    average = (
-        sum(returns)
-        / len(returns)
-    )
+    average = sum(returns) / len(returns)
 
-    variance = (
-        sum(
-            (value - average) ** 2
-            for value in returns
-        )
-        / (len(returns) - 1)
-    )
+    variance = sum(
+        (r - average) ** 2
+        for r in returns
+    ) / (len(returns) - 1)
 
-    deviation = math.sqrt(
-        variance
-    )
+    standard_deviation = math.sqrt(variance)
 
-    if deviation == 0:
+    if standard_deviation == 0:
         return 0.0
 
     return (
-        average
-        / deviation
-        * math.sqrt(252)
-    )
+        average / standard_deviation
+    ) * math.sqrt(252)
 
 
-def profit_factor(trades):
+def calculate_buy_hold(bars):
+    if len(bars) < 2:
+        return 0.0
 
-    gross_profit = sum(
-        trade
-        for trade in trades
-        if trade > 0
-    )
+    first_price = bars[0]["close"]
+    last_price = bars[-1]["close"]
 
-    gross_loss = abs(
-        sum(
-            trade
-            for trade in trades
-            if trade < 0
-        )
-    )
-
-    if gross_loss == 0:
-
-        if gross_profit > 0:
-            return float("inf")
-
+    if first_price <= 0:
         return 0.0
 
     return (
-        gross_profit
-        / gross_loss
+        (last_price / first_price) - 1
     )
 
 
-def losing_streak(trades):
+# ============================================================
+# DATOS
+# ============================================================
 
-    current = 0
-    maximum = 0
+def get_data(symbol, years):
+    end_date = datetime.now(timezone.utc).date()
 
-    for trade in trades:
+    start_date = (
+        end_date
+        - timedelta(days=int(years * 365.25))
+    )
 
-        if trade < 0:
+    request = StockBarsRequest(
+        symbol_or_symbols=symbol,
+        timeframe=TimeFrame.Day,
+        start=datetime.combine(
+            start_date,
+            datetime.min.time(),
+            tzinfo=timezone.utc
+        ),
+        end=datetime.combine(
+            end_date + timedelta(days=1),
+            datetime.min.time(),
+            tzinfo=timezone.utc
+        ),
+        adjustment="all"
+    )
 
-            current += 1
+    response = client.get_stock_bars(request)
 
-            maximum = max(
-                maximum,
-                current
-            )
+    bars = response[symbol]
 
-        else:
+    cleaned = []
 
-            current = 0
+    for bar in bars:
+        cleaned.append(
+            {
+                "date": bar.timestamp.date(),
+                "open": float(bar.open),
+                "high": float(bar.high),
+                "low": float(bar.low),
+                "close": float(bar.close),
+            }
+        )
 
-    return maximum
+    cleaned.sort(
+        key=lambda x: x["date"]
+    )
 
-
-def format_pf(value):
-
-    if math.isinf(value):
-        return "INF"
-
-    return f"{value:.2f}"
+    return cleaned
 
 
 # ============================================================
-# SIMULADOR DE UNA VENTANA
+# POSICIÓN
 # ============================================================
 
-def process_window(
-    data,
-    start_index,
-    end_index,
-    capital,
-    position,
+def calculate_position_size(
+    equity,
     entry_price,
-    stop_price,
-    pending_entry
+    stop_price
 ):
+    if equity <= 0:
+        return 0
 
-    trades = []
-    equity_curve = []
+    risk_amount = (
+        equity * RISK_PER_TRADE
+    )
 
-    commissions = 0.0
+    risk_per_share = abs(
+        entry_price - stop_price
+    )
 
-    wins = 0
-    losses = 0
+    if risk_per_share <= 0:
+        return 0
 
-    closes = [
-        row[4]
-        for row in data
+    shares = int(
+        risk_amount / risk_per_share
+    )
+
+    return max(shares, 0)
+
+
+# ============================================================
+# BACKTEST CONTINUO
+# ============================================================
+
+def run_backtest(symbol, bars):
+    if len(bars) <= WARMUP_DAYS + 20:
+        return None
+
+    warmup = bars[
+        :WARMUP_DAYS
     ]
 
-    for i in range(
-        start_index,
-        end_index
+    test_bars = bars[
+        WARMUP_DAYS:
+    ]
+
+    cash = START_CAPITAL
+
+    shares = 0
+
+    entry_price = None
+    entry_date = None
+    signal_date = None
+    stop_price = None
+
+    position_equity_at_entry = None
+
+    pending_entry = False
+    pending_signal_date = None
+
+    trades = []
+
+    equity_curve = []
+    equity_dates = []
+
+    audit_errors = []
+
+    daily_trade_count = 0
+    current_date = None
+
+    closes = [
+        item["close"]
+        for item in warmup
+    ]
+
+    all_bars = []
+
+    all_bars.extend(warmup)
+    all_bars.extend(test_bars)
+
+    for index in range(
+        WARMUP_DAYS,
+        len(all_bars)
     ):
+        bar = all_bars[index]
 
-        timestamp = data[i][0]
-        open_price = data[i][1]
-        high = data[i][2]
-        low = data[i][3]
-        close = data[i][4]
+        date = bar["date"]
 
-        del timestamp
-        del high
+        open_price = bar["open"]
+        high_price = bar["high"]
+        low_price = bar["low"]
+        close_price = bar["close"]
 
-        # ====================================================
-        # INDICADORES
-        # ====================================================
+        if current_date != date:
+            current_date = date
+            daily_trade_count = 0
 
-        history = closes[:i + 1]
+        # ----------------------------------------------------
+        # EJECUTAR ENTRADA PENDIENTE
+        # ----------------------------------------------------
 
-        ema20 = ema(
-            history,
-            20
-        )
+        if pending_entry and shares == 0:
 
-        rsi14 = rsi(
-            history,
-            14
-        )
+            if daily_trade_count >= MAX_TRADES_PER_DAY:
+                pending_entry = False
 
-        if (
-            ema20 is None
-            or rsi14 is None
-        ):
-
-            if position > 0:
-
-                equity = (
-                    capital
-                    + close * position
+            else:
+                actual_entry = (
+                    open_price
+                    * (1 + SLIPPAGE_RATE)
                 )
+
+                actual_stop = (
+                    actual_entry
+                    * (1 - STOP_PERCENT)
+                )
+
+                equity_before = (
+                    cash
+                )
+
+                position_size = calculate_position_size(
+                    equity_before,
+                    actual_entry,
+                    actual_stop
+                )
+
+                if position_size > 0:
+
+                    total_cost = (
+                        actual_entry
+                        * position_size
+                    )
+
+                    commission = (
+                        position_size
+                        * COMMISSION_PER_SHARE
+                    )
+
+                    if (
+                        total_cost
+                        + commission
+                        <= cash
+                    ):
+
+                        cash -= (
+                            total_cost
+                            + commission
+                        )
+
+                        shares = position_size
+
+                        entry_price = actual_entry
+                        entry_date = date
+                        signal_date = pending_signal_date
+                        stop_price = actual_stop
+
+                        position_equity_at_entry = (
+                            equity_before
+                        )
+
+                        daily_trade_count += 1
+
+                        pending_entry = False
+
+                    else:
+                        pending_entry = False
+
+                else:
+                    pending_entry = False
+
+        # ----------------------------------------------------
+        # GESTIONAR POSICIÓN
+        # ----------------------------------------------------
+
+        if shares > 0:
+
+            exit_price = None
+            exit_reason = None
+
+            # GAP
+            if open_price <= stop_price:
+
+                exit_price = (
+                    open_price
+                    * (1 - SLIPPAGE_RATE)
+                )
+
+                exit_reason = "STOP_GAP"
+
+            # STOP INTRADÍA
+            elif low_price <= stop_price:
+
+                exit_price = (
+                    stop_price
+                    * (1 - SLIPPAGE_RATE)
+                )
+
+                exit_reason = "STOP"
 
             else:
 
-                equity = capital
-
-            equity_curve.append(
-                equity
-            )
-
-            continue
-
-        # ====================================================
-        # ENTRADA PENDIENTE
-        # ====================================================
-
-        if (
-            position == 0
-            and pending_entry
-        ):
-
-            execution_price = (
-                open_price
-                * (
-                    1
-                    + SLIPPAGE_PERCENT
-                )
-            )
-
-            stop_distance = (
-                execution_price
-                * STOP_PERCENT
-            )
-
-            risk_amount = (
-                capital
-                * RISK_PER_TRADE
-            )
-
-            if stop_distance > 0:
-
-                shares_risk = int(
-                    risk_amount
-                    / stop_distance
+                historical_closes = (
+                    closes
+                    + [
+                        close_price
+                    ]
                 )
 
-            else:
-
-                shares_risk = 0
-
-            share_cost = (
-                execution_price
-                + COMMISSION_PER_SHARE
-            )
-
-            if share_cost > 0:
-
-                shares_capital = int(
-                    capital
-                    / share_cost
+                ema20 = ema(
+                    historical_closes,
+                    20
                 )
 
-            else:
+                if (
+                    ema20 is not None
+                    and close_price < ema20
+                ):
 
-                shares_capital = 0
+                    exit_price = (
+                        close_price
+                        * (1 - SLIPPAGE_RATE)
+                    )
 
-            shares = min(
-                shares_risk,
-                shares_capital
-            )
+                    exit_reason = "EMA"
 
-            if shares > 0:
+            # ------------------------------------------------
+            # CERRAR
+            # ------------------------------------------------
 
-                entry_commission = (
+            if exit_price is not None:
+
+                gross_pnl = (
+                    exit_price
+                    - entry_price
+                ) * shares
+
+                exit_commission = (
                     shares
                     * COMMISSION_PER_SHARE
                 )
 
-                total_cost = (
-                    execution_price
-                    * shares
-                    + entry_commission
-                )
-
-                if total_cost <= capital:
-
-                    capital -= total_cost
-
-                    position = shares
-
-                    entry_price = (
-                        execution_price
-                    )
-
-                    stop_price = (
-                        entry_price
-                        * (
-                            1
-                            - STOP_PERCENT
-                        )
-                    )
-
-                    commissions += (
-                        entry_commission
-                    )
-
-            pending_entry = False
-
-        # ====================================================
-        # GESTION DE POSICION
-        # ====================================================
-
-        if position > 0:
-
-            exit_reason = None
-            exit_price = None
-
-            # -----------------------------------------------
-            # STOP POR GAP
-            # -----------------------------------------------
-
-            if open_price <= stop_price:
-
-                exit_reason = "STOP_GAP"
-
-                exit_price = (
-                    open_price
-                    * (
-                        1
-                        - SLIPPAGE_PERCENT
-                    )
-                )
-
-            # -----------------------------------------------
-            # STOP NORMAL
-            # -----------------------------------------------
-
-            elif low <= stop_price:
-
-                exit_reason = "STOP"
-
-                exit_price = (
-                    stop_price
-                    * (
-                        1
-                        - SLIPPAGE_PERCENT
-                    )
-                )
-
-            # -----------------------------------------------
-            # SALIDA POR EMA
-            # -----------------------------------------------
-
-            elif close < ema20:
-
-                exit_reason = "EMA"
-
-                exit_price = (
-                    close
-                    * (
-                        1
-                        - SLIPPAGE_PERCENT
-                    )
-                )
-
-            # -----------------------------------------------
-            # EJECUTAR SALIDA
-            # -----------------------------------------------
-
-            if exit_reason is not None:
-
-                gross_result = (
-                    exit_price
-                    - entry_price
-                ) * position
-
-                exit_commission = (
-                    position
-                    * COMMISSION_PER_SHARE
-                )
-
-                pnl = (
-                    gross_result
+                net_pnl = (
+                    gross_pnl
                     - exit_commission
                 )
 
-                capital += (
+                cash += (
                     exit_price
-                    * position
+                    * shares
                 )
 
-                capital -= (
-                    exit_commission
+                cash -= exit_commission
+
+                equity_after = cash
+
+                planned_risk = (
+                    abs(
+                        entry_price
+                        - stop_price
+                    )
+                    * shares
                 )
 
-                trades.append(
-                    pnl
-                )
+                actual_risk_pct = 0.0
 
-                commissions += (
-                    exit_commission
-                )
+                if (
+                    position_equity_at_entry
+                    > 0
+                ):
+                    actual_risk_pct = (
+                        planned_risk
+                        / position_equity_at_entry
+                    )
 
-                if pnl >= 0:
-                    wins += 1
-                else:
-                    losses += 1
+                trade = {
+                    "symbol": symbol,
+                    "signal_date": signal_date,
+                    "entry_date": entry_date,
+                    "entry_price": entry_price,
+                    "stop_price": stop_price,
+                    "exit_date": date,
+                    "exit_price": exit_price,
+                    "shares": shares,
+                    "exit_reason": exit_reason,
+                    "gross_pnl": gross_pnl,
+                    "entry_commission": (
+                        shares
+                        * COMMISSION_PER_SHARE
+                    ),
+                    "exit_commission": exit_commission,
+                    "total_commission": (
+                        shares
+                        * COMMISSION_PER_SHARE
+                        * 2
+                    ),
+                    "net_pnl": net_pnl,
+                    "planned_risk": planned_risk,
+                    "planned_risk_pct": actual_risk_pct,
+                    "equity_before": (
+                        position_equity_at_entry
+                    ),
+                    "equity_after": equity_after,
+                }
 
-                position = 0
+                trades.append(trade)
 
-                entry_price = 0.0
+                shares = 0
 
-                stop_price = 0.0
+                entry_price = None
+                entry_date = None
+                signal_date = None
+                stop_price = None
+                position_equity_at_entry = None
 
-        # ====================================================
-        # NUEVA SEÑAL
-        # ====================================================
+        # ----------------------------------------------------
+        # SEÑAL PARA MAÑANA
+        # ----------------------------------------------------
 
-        if (
-            position == 0
-            and not pending_entry
-        ):
+        if shares == 0 and not pending_entry:
 
-            signal = (
-                close > ema20
-                and rsi14 < 70
+            historical_closes = (
+                closes
+                + [
+                    close_price
+                ]
             )
 
-            if signal:
-
-                pending_entry = True
-
-        # ====================================================
-        # EQUITY
-        # ====================================================
-
-        if position > 0:
-
-            market_value = (
-                close
-                * position
+            ema20 = ema(
+                historical_closes,
+                20
             )
 
-            equity = (
-                capital
-                + market_value
+            rsi14 = rsi(
+                historical_closes,
+                14
             )
 
-        else:
+            if (
+                ema20 is not None
+                and rsi14 is not None
+            ):
 
-            equity = capital
+                if (
+                    close_price > ema20
+                    and rsi14 < 70
+                ):
 
-        equity_curve.append(
-            equity
+                    pending_entry = True
+                    pending_signal_date = date
+
+        # ----------------------------------------------------
+        # EQUITY REAL
+        # ----------------------------------------------------
+
+        market_value = (
+            shares
+            * close_price
         )
 
-    return {
-        "capital": capital,
-        "position": position,
-        "entry_price": entry_price,
-        "stop_price": stop_price,
-        "pending_entry": pending_entry,
-        "trades": trades,
-        "equity": equity_curve,
-        "commissions": commissions,
-        "wins": wins,
-        "losses": losses
-    }
+        total_equity = (
+            cash
+            + market_value
+        )
 
+        if total_equity < 0:
+            audit_errors.append(
+                f"{date}: EQUITY NEGATIVA"
+            )
 
-# ============================================================
-# WALK-FORWARD REAL
-# ============================================================
+        equity_curve.append(
+            total_equity
+        )
 
-def run_walk_forward(data):
+        equity_dates.append(
+            date
+        )
 
-    minimum_required = (
-        WARMUP_DAYS
-        + TEST_WINDOW_DAYS
-        + 20
-    )
-
-    if len(data) < minimum_required:
-        return None
-
-    dates = [
-        row[0]
-        for row in data
-    ]
-
-    closes = [
-        row[4]
-        for row in data
-    ]
+        closes.append(
+            close_price
+        )
 
     # ========================================================
-    # ESTADO GLOBAL
+    # CERRAR POSICIÓN FINAL
     # ========================================================
 
-    capital = INITIAL_CAPITAL
+    if shares > 0:
 
-    position = 0
-    entry_price = 0.0
-    stop_price = 0.0
-    pending_entry = False
+        final_bar = all_bars[-1]
 
-    all_trades = []
-    all_equity = []
+        final_price = (
+            final_bar["close"]
+            * (1 - SLIPPAGE_RATE)
+        )
 
-    total_commissions = 0.0
+        gross_pnl = (
+            final_price
+            - entry_price
+        ) * shares
 
-    total_wins = 0
-    total_losses = 0
+        exit_commission = (
+            shares
+            * COMMISSION_PER_SHARE
+        )
+
+        net_pnl = (
+            gross_pnl
+            - exit_commission
+        )
+
+        cash += (
+            final_price
+            * shares
+        )
+
+        cash -= exit_commission
+
+        planned_risk = (
+            abs(
+                entry_price
+                - stop_price
+            )
+            * shares
+        )
+
+        risk_pct = 0.0
+
+        if position_equity_at_entry > 0:
+            risk_pct = (
+                planned_risk
+                / position_equity_at_entry
+            )
+
+        trades.append(
+            {
+                "symbol": symbol,
+                "signal_date": signal_date,
+                "entry_date": entry_date,
+                "entry_price": entry_price,
+                "stop_price": stop_price,
+                "exit_date": final_bar["date"],
+                "exit_price": final_price,
+                "shares": shares,
+                "exit_reason": "END",
+                "gross_pnl": gross_pnl,
+                "entry_commission": (
+                    shares
+                    * COMMISSION_PER_SHARE
+                ),
+                "exit_commission": exit_commission,
+                "total_commission": (
+                    shares
+                    * COMMISSION_PER_SHARE
+                    * 2
+                ),
+                "net_pnl": net_pnl,
+                "planned_risk": planned_risk,
+                "planned_risk_pct": risk_pct,
+                "equity_before": (
+                    position_equity_at_entry
+                ),
+                "equity_after": cash,
+            }
+        )
+
+        shares = 0
+
+    # ========================================================
+    # AUDITORÍA DE RIESGO
+    # ========================================================
+
+    max_risk_pct = 0.0
+
+    for trade in trades:
+
+        risk_pct = trade[
+            "planned_risk_pct"
+        ]
+
+        if risk_pct > max_risk_pct:
+            max_risk_pct = risk_pct
+
+        if risk_pct > (
+            RISK_PER_TRADE + 0.001
+        ):
+            audit_errors.append(
+                (
+                    f"{trade['entry_date']}: "
+                    f"RIESGO EXCESIVO "
+                    f"{risk_pct * 100:.2f}%"
+                )
+            )
+
+    # ========================================================
+    # AUDITORÍA DE CASH
+    # ========================================================
+
+    if cash < -0.01:
+        audit_errors.append(
+            "CASH FINAL NEGATIVO"
+        )
+
+    # ========================================================
+    # VENTANAS 63 DÍAS
+    # ========================================================
 
     windows = []
 
-    # ========================================================
-    # PRIMER BLOQUE OOS
-    # ========================================================
+    total_points = len(
+        equity_curve
+    )
 
-    window_start = WARMUP_DAYS
+    window_start = 0
 
-    window_number = 1
-
-    while window_start < len(data):
+    while window_start < total_points:
 
         window_end = min(
             window_start
             + TEST_WINDOW_DAYS,
-            len(data)
+            total_points
         )
 
-        # -----------------------------------------------
-        # IMPORTANTE:
-        # Antes de cada bloque OOS, los indicadores
-        # utilizan únicamente información disponible
-        # hasta ese momento.
-        # -----------------------------------------------
+        window_equity = equity_curve[
+            window_start:window_end
+        ]
 
-        starting_capital = capital
+        window_dates = equity_dates[
+            window_start:window_end
+        ]
 
-        result = process_window(
-            data,
-            window_start,
-            window_end,
-            capital,
-            position,
-            entry_price,
-            stop_price,
-            pending_entry
+        if len(window_equity) < 2:
+            break
+
+        starting_equity = (
+            window_equity[0]
         )
 
-        capital = result["capital"]
-
-        position = result["position"]
-
-        entry_price = result["entry_price"]
-
-        stop_price = result["stop_price"]
-
-        pending_entry = result["pending_entry"]
-
-        window_trades = result["trades"]
-
-        window_equity = result["equity"]
-
-        window_commissions = (
-            result["commissions"]
+        ending_equity = (
+            window_equity[-1]
         )
 
-        window_wins = result["wins"]
-
-        window_losses = result["losses"]
-
-        all_trades.extend(
-            window_trades
-        )
-
-        all_equity.extend(
-            window_equity
-        )
-
-        total_commissions += (
-            window_commissions
-        )
-
-        total_wins += (
-            window_wins
-        )
-
-        total_losses += (
-            window_losses
-        )
-
-        # -----------------------------------------------
-        # METRICAS DE LA VENTANA
-        # -----------------------------------------------
-
-        if starting_capital > 0:
-
-            window_return = (
-                (
-                    capital
-                    / starting_capital
-                ) - 1
-            ) * 100
-
-        else:
-
+        if starting_equity <= 0:
             window_return = 0.0
+        else:
+            window_return = (
+                ending_equity
+                / starting_equity
+            ) - 1
 
-        window_pf = profit_factor(
-            window_trades
-        )
+        window_trades = []
 
-        _, window_dd = (
-            max_drawdown(
+        start_date = window_dates[0]
+        end_date = window_dates[-1]
+
+        for trade in trades:
+
+            exit_date = trade[
+                "exit_date"
+            ]
+
+            if (
+                start_date
+                <= exit_date
+                <= end_date
+            ):
+                window_trades.append(
+                    trade
+                )
+
+        window_dd, _ = (
+            calculate_max_drawdown(
                 window_equity
             )
         )
 
-        window_sharpe = sharpe(
-            window_equity
-        )
-
-        window_win_rate = (
-            window_wins
-            / len(window_trades)
-            * 100
-            if window_trades
-            else 0.0
-        )
-
         windows.append(
             {
-                "number":
-                    window_number,
-
-                "start":
-                    dates[window_start]
-                    .strftime(
-                        "%Y-%m-%d"
-                    ),
-
-                "end":
-                    dates[window_end - 1]
-                    .strftime(
-                        "%Y-%m-%d"
-                    ),
-
-                "starting_capital":
-                    starting_capital,
-
-                "ending_capital":
-                    capital,
-
-                "return":
-                    window_return,
-
-                "trades":
-                    len(window_trades),
-
-                "wins":
-                    window_wins,
-
-                "losses":
-                    window_losses,
-
-                "win_rate":
-                    window_win_rate,
-
-                "profit_factor":
-                    window_pf,
-
-                "drawdown":
-                    window_dd,
-
-                "sharpe":
-                    window_sharpe,
-
-                "commissions":
-                    window_commissions
+                "start_date": start_date,
+                "end_date": end_date,
+                "starting_equity": starting_equity,
+                "ending_equity": ending_equity,
+                "return": window_return,
+                "trades": window_trades,
+                "drawdown": window_dd,
+                "sharpe": calculate_sharpe(
+                    window_equity
+                ),
             }
         )
-
-        window_number += 1
 
         window_start = window_end
 
     # ========================================================
-    # CIERRE FINAL DE POSICION
+    # MÉTRICAS FINALES
     # ========================================================
 
-    if position > 0:
+    initial_equity = (
+        equity_curve[0]
+        if equity_curve
+        else START_CAPITAL
+    )
 
-        final_close = closes[-1]
-
-        final_price = (
-            final_close
-            * (
-                1
-                - SLIPPAGE_PERCENT
-            )
-        )
-
-        gross_result = (
-            final_price
-            - entry_price
-        ) * position
-
-        exit_commission = (
-            position
-            * COMMISSION_PER_SHARE
-        )
-
-        pnl = (
-            gross_result
-            - exit_commission
-        )
-
-        capital += (
-            final_price
-            * position
-        )
-
-        capital -= (
-            exit_commission
-        )
-
-        all_trades.append(
-            pnl
-        )
-
-        total_commissions += (
-            exit_commission
-        )
-
-        if pnl >= 0:
-            total_wins += 1
-        else:
-            total_losses += 1
-
-        position = 0
-
-    # ========================================================
-    # METRICAS GLOBALES
-    # ========================================================
-
-    final_capital = capital
+    final_equity = (
+        equity_curve[-1]
+        if equity_curve
+        else START_CAPITAL
+    )
 
     total_return = (
-        (
-            final_capital
-            / INITIAL_CAPITAL
-        ) - 1
-    ) * 100
+        final_equity
+        / initial_equity
+    ) - 1
 
-    total_trades = len(
-        all_trades
+    buy_hold = calculate_buy_hold(
+        test_bars
     )
 
-    total_win_rate = (
-        total_wins
-        / total_trades
-        * 100
-        if total_trades
-        else 0.0
-    )
-
-    total_pf = profit_factor(
-        all_trades
-    )
-
-    total_dd_dollars, total_dd = (
-        max_drawdown(
-            all_equity
+    max_drawdown, _ = (
+        calculate_max_drawdown(
+            equity_curve
         )
     )
 
-    total_sharpe = sharpe(
-        all_equity
+    sharpe = calculate_sharpe(
+        equity_curve
     )
 
-    total_losing_streak = (
-        losing_streak(
-            all_trades
+    profit_factor = (
+        calculate_profit_factor(
+            trades
         )
     )
 
-    # ========================================================
-    # BUY & HOLD
-    # ========================================================
-
-    buy_hold = (
-        (
-            closes[-1]
-            / closes[0]
-        ) - 1
-    ) * 100
-
-    # ========================================================
-    # CAGR
-    # ========================================================
-
-    total_days = (
-        dates[-1]
-        - dates[0]
-    ).total_seconds() / 86400
-
-    years = max(
-        total_days / 365.25,
-        0.01
-    )
-
-    cagr = (
-        (
-            final_capital
-            / INITIAL_CAPITAL
+    win_rate = (
+        calculate_win_rate(
+            trades
         )
-        ** (1 / years)
-        - 1
-    ) * 100
+    )
+
+    total_commissions = sum(
+        trade["total_commission"]
+        for trade in trades
+    )
 
     # ========================================================
-    # CONSISTENCIA DE VENTANAS
+    # AUDITORÍA DE VENTANAS
     # ========================================================
 
-    positive_windows = sum(
-        1
-        for window in windows
-        if window["return"] > 0
-    )
+    suspicious_windows = []
 
-    negative_windows = sum(
-        1
-        for window in windows
-        if window["return"] < 0
-    )
+    for number, window in enumerate(
+        windows,
+        start=1
+    ):
 
-    flat_windows = (
-        len(windows)
-        - positive_windows
-        - negative_windows
-    )
+        window_return = (
+            window["return"]
+        )
 
-    if windows:
+        # No es un error automático.
+        # Solamente marca ventanas
+        # extraordinarias para revisión.
 
-        average_window_return = (
-            sum(
-                window["return"]
-                for window in windows
+        if abs(window_return) > 0.10:
+            suspicious_windows.append(
+                {
+                    "number": number,
+                    "return": window_return,
+                    "start": window[
+                        "start_date"
+                    ],
+                    "end": window[
+                        "end_date"
+                    ],
+                }
             )
-            / len(windows)
-        )
-
-    else:
-
-        average_window_return = 0.0
 
     return {
-        "start_date":
-            dates[0].strftime(
-                "%Y-%m-%d"
-            ),
-
-        "end_date":
-            dates[-1].strftime(
-                "%Y-%m-%d"
-            ),
-
-        "final_capital":
-            final_capital,
-
-        "return":
-            total_return,
-
-        "buy_hold":
-            buy_hold,
-
-        "vs_buy_hold":
-            total_return - buy_hold,
-
-        "cagr":
-            cagr,
-
-        "trades":
-            total_trades,
-
-        "wins":
-            total_wins,
-
-        "losses":
-            total_losses,
-
-        "win_rate":
-            total_win_rate,
-
-        "profit_factor":
-            total_pf,
-
-        "drawdown":
-            total_dd,
-
-        "drawdown_dollars":
-            total_dd_dollars,
-
-        "sharpe":
-            total_sharpe,
-
-        "losing_streak":
-            total_losing_streak,
-
-        "commissions":
-            total_commissions,
-
-        "windows":
-            windows,
-
-        "total_windows":
-            len(windows),
-
-        "positive_windows":
-            positive_windows,
-
-        "negative_windows":
-            negative_windows,
-
-        "flat_windows":
-            flat_windows,
-
-        "average_window_return":
-            average_window_return
+        "symbol": symbol,
+        "initial_equity": initial_equity,
+        "final_equity": final_equity,
+        "total_return": total_return,
+        "buy_hold": buy_hold,
+        "trades": trades,
+        "win_rate": win_rate,
+        "profit_factor": profit_factor,
+        "max_drawdown": max_drawdown,
+        "sharpe": sharpe,
+        "total_commissions": total_commissions,
+        "windows": windows,
+        "audit_errors": audit_errors,
+        "suspicious_windows": suspicious_windows,
+        "max_risk_pct": max_risk_pct,
+        "equity_curve": equity_curve,
+        "equity_dates": equity_dates,
     }
 
 
 # ============================================================
-# EJECUCION
+# CSV
 # ============================================================
 
-print()
-print("==============================================")
-print("       AI TRADER — MULTI BACKTEST V6")
-print("==============================================")
-print()
-print("WALK-FORWARD REAL / ROLLING OOS")
-print(f"WARMUP: {WARMUP_DAYS} días")
-print(
-    f"VENTANA OOS: {TEST_WINDOW_DAYS} días"
-)
-print()
-print("DATOS AJUSTADOS: SPLITS + DIVIDENDOS")
-print("ENTRADA: OPEN DEL DÍA SIGUIENTE")
-print("STOP: LOW REAL + PROTECCION GAP")
-print("SLIPPAGE + COMISIONES ACTIVOS")
-print()
-print("IMPORTANTE: SOLO BACKTEST")
-print("NO SE ENVIAN ORDENES")
-print()
+def save_trades(all_results):
 
-results = []
+    with open(
+        TRADE_FILE,
+        "w",
+        newline="",
+        encoding="utf-8"
+    ) as file:
+
+        writer = csv.writer(file)
+
+        writer.writerow(
+            [
+                "symbol",
+                "signal_date",
+                "entry_date",
+                "entry_price",
+                "stop_price",
+                "exit_date",
+                "exit_price",
+                "shares",
+                "exit_reason",
+                "gross_pnl",
+                "entry_commission",
+                "exit_commission",
+                "total_commission",
+                "net_pnl",
+                "planned_risk",
+                "planned_risk_pct",
+                "equity_before",
+                "equity_after",
+            ]
+        )
+
+        for result in all_results:
+
+            for trade in result["trades"]:
+
+                writer.writerow(
+                    [
+                        trade["symbol"],
+                        trade["signal_date"],
+                        trade["entry_date"],
+                        f"{trade['entry_price']:.4f}",
+                        f"{trade['stop_price']:.4f}",
+                        trade["exit_date"],
+                        f"{trade['exit_price']:.4f}",
+                        trade["shares"],
+                        trade["exit_reason"],
+                        f"{trade['gross_pnl']:.2f}",
+                        f"{trade['entry_commission']:.2f}",
+                        f"{trade['exit_commission']:.2f}",
+                        f"{trade['total_commission']:.2f}",
+                        f"{trade['net_pnl']:.2f}",
+                        f"{trade['planned_risk']:.2f}",
+                        f"{trade['planned_risk_pct'] * 100:.4f}",
+                        f"{trade['equity_before']:.2f}",
+                        f"{trade['equity_after']:.2f}",
+                    ]
+                )
 
 
-for symbol in SYMBOLS:
+# ============================================================
+# REPORTE
+# ============================================================
 
-    print(
-        f"Analizando {symbol}..."
+def generate_report(results):
+
+    lines = []
+
+    lines.append(
+        "=============================================="
     )
 
-    for period_name, days in PERIODS.items():
+    lines.append(
+        "       AI TRADER — MULTI BACKTEST V7"
+    )
 
-        end = datetime.now(
-            timezone.utc
+    lines.append(
+        "=============================================="
+    )
+
+    lines.append(
+        "AUDITORÍA DE CONTABILIDAD Y RIESGO"
+    )
+
+    lines.append(
+        "WARMUP: 252 días"
+    )
+
+    lines.append(
+        "VENTANA: 63 días"
+    )
+
+    lines.append(
+        "ENTRADA: OPEN DEL DÍA SIGUIENTE"
+    )
+
+    lines.append(
+        "STOP: LOW REAL + PROTECCIÓN GAP"
+    )
+
+    lines.append(
+        "SLIPPAGE + COMISIONES ACTIVOS"
+    )
+
+    lines.append(
+        "DATOS AJUSTADOS: SPLITS + DIVIDENDOS"
+    )
+
+    lines.append(
+        "IMPORTANTE: SOLO BACKTEST"
+    )
+
+    lines.append(
+        "NO SE ENVIAN ORDENES"
+    )
+
+    lines.append("")
+
+    for result in results:
+
+        symbol = result["symbol"]
+
+        lines.append(
+            "=============================================="
         )
 
-        start = (
-            end
-            - timedelta(
-                days=days
+        lines.append(
+            f"{symbol}"
+        )
+
+        lines.append(
+            "=============================================="
+        )
+
+        lines.append(
+            f"Capital inicial: "
+            f"${result['initial_equity']:,.2f}"
+        )
+
+        lines.append(
+            f"Capital final: "
+            f"${result['final_equity']:,.2f}"
+        )
+
+        lines.append(
+            f"Retorno total: "
+            f"{result['total_return'] * 100:.2f}%"
+        )
+
+        lines.append(
+            f"Buy & Hold: "
+            f"{result['buy_hold'] * 100:.2f}%"
+        )
+
+        lines.append(
+            f"Operaciones: "
+            f"{len(result['trades'])}"
+        )
+
+        lines.append(
+            f"Win rate: "
+            f"{result['win_rate'] * 100:.2f}%"
+        )
+
+        pf = result["profit_factor"]
+
+        if math.isinf(pf):
+            pf_text = "INF"
+        else:
+            pf_text = f"{pf:.2f}"
+
+        lines.append(
+            f"Profit Factor: {pf_text}"
+        )
+
+        lines.append(
+            f"Max Drawdown: "
+            f"{result['max_drawdown'] * 100:.2f}%"
+        )
+
+        lines.append(
+            f"Sharpe: "
+            f"{result['sharpe']:.2f}"
+        )
+
+        lines.append(
+            f"Comisiones: "
+            f"${result['total_commissions']:,.2f}"
+        )
+
+        lines.append(
+            f"Máximo riesgo planeado: "
+            f"{result['max_risk_pct'] * 100:.4f}%"
+        )
+
+        lines.append("")
+
+        lines.append(
+            "----- VENTANAS OOS -----"
+        )
+
+        for number, window in enumerate(
+            result["windows"],
+            start=1
+        ):
+
+            window_trades = (
+                window["trades"]
             )
+
+            window_pf = (
+                calculate_profit_factor(
+                    window_trades
+                )
+            )
+
+            if math.isinf(window_pf):
+                window_pf_text = "INF"
+            else:
+                window_pf_text = (
+                    f"{window_pf:.2f}"
+                )
+
+            lines.append(
+                (
+                    f"W{number:02d} "
+                    f"{window['start_date']} -> "
+                    f"{window['end_date']} | "
+                    f"${window['starting_equity']:,.2f} -> "
+                    f"${window['ending_equity']:,.2f} | "
+                    f"RET "
+                    f"{window['return'] * 100:.2f}% | "
+                    f"DD "
+                    f"{window['drawdown'] * 100:.2f}% | "
+                    f"TRADES "
+                    f"{len(window_trades)} | "
+                    f"PF "
+                    f"{window_pf_text}"
+                )
+            )
+
+        lines.append("")
+
+        lines.append(
+            "----- AUDITORÍA -----"
         )
 
-        request = StockBarsRequest(
-            symbol_or_symbols=[
-                symbol
-            ],
-            timeframe=TimeFrame.Day,
-            start=start,
-            end=end,
-            feed=DataFeed.IEX,
-            adjustment="all"
+        if not result["audit_errors"]:
+
+            lines.append(
+                "AUDITORÍA: OK"
+            )
+
+        else:
+
+            lines.append(
+                "AUDITORÍA: ERROR"
+            )
+
+            for error in result[
+                "audit_errors"
+            ]:
+
+                lines.append(
+                    f"  - {error}"
+                )
+
+        lines.append("")
+
+        if result[
+            "suspicious_windows"
+        ]:
+
+            lines.append(
+                "VENTANAS EXTRAORDINARIAS:"
+            )
+
+            for item in result[
+                "suspicious_windows"
+            ]:
+
+                lines.append(
+                    (
+                        f"  W{item['number']:02d} "
+                        f"{item['start']} -> "
+                        f"{item['end']} | "
+                        f"{item['return'] * 100:.2f}%"
+                    )
+                )
+
+        else:
+
+            lines.append(
+                "VENTANAS EXTRAORDINARIAS: NINGUNA"
+            )
+
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+
+    print(
+        "=============================================="
+    )
+
+    print(
+        "       AI TRADER — MULTI BACKTEST V7"
+    )
+
+    print(
+        "=============================================="
+    )
+
+    print(
+        "AUDITORÍA DE CONTABILIDAD Y RIESGO"
+    )
+
+    print(
+        "WARMUP: 252 días"
+    )
+
+    print(
+        "VENTANA OOS: 63 días"
+    )
+
+    print(
+        "DATOS AJUSTADOS: SPLITS + DIVIDENDOS"
+    )
+
+    print(
+        "ENTRADA: OPEN DEL DÍA SIGUIENTE"
+    )
+
+    print(
+        "STOP: LOW REAL + PROTECCIÓN GAP"
+    )
+
+    print(
+        "SLIPPAGE + COMISIONES ACTIVOS"
+    )
+
+    print(
+        "IMPORTANTE: SOLO BACKTEST"
+    )
+
+    print(
+        "NO SE ENVIAN ORDENES"
+    )
+
+    print("")
+
+    all_results = []
+
+    for symbol in SYMBOLS:
+
+        print(
+            f"Descargando datos: {symbol}..."
         )
 
         try:
 
-            bars = (
-                data_client
-                .get_stock_bars(
-                    request
-                )
-            )
-
-            data = clean_bars(
-                bars[symbol]
-            )
-
-            if len(data) < (
-                WARMUP_DAYS
-                + TEST_WINDOW_DAYS
-                + 20
-            ):
-
-                print(
-                    f"  {period_name}: "
-                    "DATOS INSUFICIENTES"
-                )
-
-                continue
-
-            result = run_walk_forward(
-                data
-            )
-
-            if result is None:
-
-                print(
-                    f"  {period_name}: "
-                    "NO DISPONIBLE"
-                )
-
-                continue
-
-            result["symbol"] = symbol
-            result["period"] = period_name
-
-            results.append(
-                result
-            )
-
-            print(
-                f"  {period_name}: "
-                f"TOTAL "
-                f"{result['return']:.2f}% | "
-                f"B&H "
-                f"{result['buy_hold']:.2f}% | "
-                f"VENTANAS "
-                f"{result['total_windows']} | "
-                f"POSITIVAS "
-                f"{result['positive_windows']} | "
-                f"NEGATIVAS "
-                f"{result['negative_windows']}"
-            )
-
-            print(
-                f"      OOS acumulado: "
-                f"{result['return']:.2f}% | "
-                f"PF "
-                f"{format_pf(result['profit_factor'])} | "
-                f"DD "
-                f"{result['drawdown']:.2f}% | "
-                f"Sharpe "
-                f"{result['sharpe']:.2f}"
+            bars = get_data(
+                symbol,
+                5
             )
 
         except Exception as error:
 
             print(
-                f"  {period_name}: ERROR"
+                f"{symbol}: ERROR DATOS — {error}"
             )
+
+            continue
+
+        if len(bars) <= (
+            WARMUP_DAYS + 20
+        ):
 
             print(
-                f"      {error}"
+                f"{symbol}: DATOS INSUFICIENTES"
             )
 
-    print()
-
-
-# ============================================================
-# RESULTADOS GLOBALES
-# ============================================================
-
-print()
-print("==============================================")
-print("             RESULTADOS V6")
-print("==============================================")
-print()
-
-print(
-    "ACTIVO | PERIODO | TOTAL | B&H | "
-    "VENTANAS | + | - | WIN% | PF | DD | SHARPE"
-)
-
-print("-" * 115)
-
-
-for result in results:
-
-    print(
-        f"{result['symbol']:6} | "
-        f"{result['period']:7} | "
-        f"{result['return']:6.2f}% | "
-        f"{result['buy_hold']:6.2f}% | "
-        f"{result['total_windows']:8} | "
-        f"{result['positive_windows']:1} | "
-        f"{result['negative_windows']:1} | "
-        f"{result['win_rate']:5.1f}% | "
-        f"{format_pf(result['profit_factor']):>4} | "
-        f"{result['drawdown']:5.2f}% | "
-        f"{result['sharpe']:6.2f}"
-    )
-
-
-# ============================================================
-# DETALLE DE CADA VENTANA
-# ============================================================
-
-print()
-print("==============================================")
-print("          VENTANAS WALK-FORWARD")
-print("==============================================")
-print()
-
-
-for result in results:
-
-    print(
-        f"{result['symbol']} — "
-        f"{result['period']}"
-    )
-
-    print()
-
-    for window in result["windows"]:
+            continue
 
         print(
-            f"  W{window['number']:02d} | "
-            f"{window['start']} -> "
-            f"{window['end']} | "
-            f"{window['return']:7.2f}% | "
-            f"Trades "
-            f"{window['trades']:3} | "
-            f"Win "
-            f"{window['win_rate']:5.1f}% | "
-            f"PF "
-            f"{format_pf(window['profit_factor']):>4} | "
-            f"DD "
-            f"{window['drawdown']:5.2f}% | "
-            f"Sharpe "
-            f"{window['sharpe']:5.2f}"
+            f"{symbol}: "
+            f"{len(bars)} velas"
         )
 
-    print()
-
-    print(
-        f"  Ventanas positivas: "
-        f"{result['positive_windows']}"
-    )
-
-    print(
-        f"  Ventanas negativas: "
-        f"{result['negative_windows']}"
-    )
-
-    print(
-        f"  Rendimiento promedio "
-        f"por ventana: "
-        f"{result['average_window_return']:.2f}%"
-    )
-
-    print()
-
-
-# ============================================================
-# EXPORTAR RESULTADOS
-# ============================================================
-
-output = []
-
-output.append(
-    "AI TRADER — MULTI BACKTEST V6"
-)
-
-output.append(
-    "=============================================="
-)
-
-output.append(
-    "WALK-FORWARD REAL / ROLLING OOS"
-)
-
-output.append(
-    f"WARMUP: {WARMUP_DAYS} días"
-)
-
-output.append(
-    f"VENTANA OOS: {TEST_WINDOW_DAYS} días"
-)
-
-output.append(
-    "SOLO BACKTEST — NO SE ENVIAN ORDENES"
-)
-
-output.append("")
-
-output.append(
-    "RESULTADOS V6"
-)
-
-output.append(
-    "ACTIVO | PERIODO | TOTAL | B&H | "
-    "VENTANAS | + | - | WIN% | PF | DD | SHARPE"
-)
-
-output.append(
-    "-" * 115
-)
-
-
-for result in results:
-
-    output.append(
-        f"{result['symbol']:6} | "
-        f"{result['period']:7} | "
-        f"{result['return']:6.2f}% | "
-        f"{result['buy_hold']:6.2f}% | "
-        f"{result['total_windows']:8} | "
-        f"{result['positive_windows']:1} | "
-        f"{result['negative_windows']:1} | "
-        f"{result['win_rate']:5.1f}% | "
-        f"{format_pf(result['profit_factor']):>4} | "
-        f"{result['drawdown']:5.2f}% | "
-        f"{result['sharpe']:6.2f}"
-    )
-
-
-output.append("")
-output.append(
-    "VENTANAS WALK-FORWARD"
-)
-output.append(
-    "=============================================="
-)
-output.append("")
-
-
-for result in results:
-
-    output.append(
-        f"{result['symbol']} — "
-        f"{result['period']}"
-    )
-
-    output.append("")
-
-    for window in result["windows"]:
-
-        output.append(
-            f"W{window['number']:02d} | "
-            f"{window['start']} -> "
-            f"{window['end']} | "
-            f"Return "
-            f"{window['return']:.2f}% | "
-            f"Trades "
-            f"{window['trades']} | "
-            f"Win "
-            f"{window['win_rate']:.1f}% | "
-            f"PF "
-            f"{format_pf(window['profit_factor'])} | "
-            f"DD "
-            f"{window['drawdown']:.2f}% | "
-            f"Sharpe "
-            f"{window['sharpe']:.2f}"
+        result = run_backtest(
+            symbol,
+            bars
         )
 
-    output.append("")
+        if result is None:
 
-    output.append(
-        f"Ventanas positivas: "
-        f"{result['positive_windows']}"
+            print(
+                f"{symbol}: BACKTEST NO DISPONIBLE"
+            )
+
+            continue
+
+        all_results.append(
+            result
+        )
+
+        print("")
+
+        print(
+            f"{symbol} TOTAL "
+            f"{result['total_return'] * 100:.2f}% "
+            f"| B&H "
+            f"{result['buy_hold'] * 100:.2f}% "
+            f"| TRADES "
+            f"{len(result['trades'])} "
+            f"| WIN "
+            f"{result['win_rate'] * 100:.1f}% "
+            f"| PF "
+            f"{result['profit_factor']:.2f} "
+            f"| DD "
+            f"{result['max_drawdown'] * 100:.2f}% "
+            f"| SHARPE "
+            f"{result['sharpe']:.2f}"
+        )
+
+        print(
+            f"AUDITORÍA "
+            f"{'OK' if not result['audit_errors'] else 'ERROR'}"
+        )
+
+        print(
+            f"RIESGO MÁXIMO "
+            f"{result['max_risk_pct'] * 100:.4f}%"
+        )
+
+        print("")
+
+    # ========================================================
+    # GUARDAR
+    # ========================================================
+
+    report = generate_report(
+        all_results
     )
-
-    output.append(
-        f"Ventanas negativas: "
-        f"{result['negative_windows']}"
-    )
-
-    output.append(
-        f"Rendimiento promedio "
-        f"por ventana: "
-        f"{result['average_window_return']:.2f}%"
-    )
-
-    output.append("")
-
-
-try:
 
     with open(
-        "backtest_results_v6.txt",
+        OUTPUT_FILE,
         "w",
         encoding="utf-8"
     ) as file:
 
-        file.write(
-            "\n".join(output)
-        )
+        file.write(report)
+
+    save_trades(
+        all_results
+    )
+
+    print(report)
 
     print(
         "=============================================="
     )
 
     print(
-        "RESULTADOS V6 EXPORTADOS"
+        f"REPORTE GUARDADO: {OUTPUT_FILE}"
     )
 
     print(
-        "Archivo: backtest_results_v6.txt"
+        f"TRADES GUARDADOS: {TRADE_FILE}"
     )
 
     print(
         "=============================================="
     )
 
-except Exception as error:
-
     print(
-        "ERROR AL EXPORTAR RESULTADOS"
-    )
-
-    print(
-        error
+        "V7 TERMINADO"
     )
 
 
-print()
-print("==============================================")
-print("       BACKTEST V6 FINALIZADO")
-print("       NO SE ENVIARON ORDENES")
-print("==============================================")
+if __name__ == "__main__":
+    main()
