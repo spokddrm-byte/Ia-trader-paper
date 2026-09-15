@@ -1,1 +1,1 @@
-web: python backtest.py
+web: python multi_backtest.py
