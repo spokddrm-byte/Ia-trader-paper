@@ -28,6 +28,7 @@ from database import (
     log_event,
     update_event,
     get_event_by_order_id,
+    get_open_position_event,
     get_today_trade_count,
     get_today_loss,
     get_today_profit_loss
@@ -58,7 +59,7 @@ def main():
         )
 
     # =========================
-    # CONEXION CON ALPACA
+    # CONEXIÓN CON ALPACA
     # =========================
 
     trading_client = TradingClient(
@@ -120,10 +121,11 @@ def main():
 
     print()
 
-    # =========================
-    # PROTECCION:
-    # POSICION EXISTENTE
-    # =========================
+    # ==================================================
+    # SINCRONIZACIÓN DE POSICIONES
+    # ==================================================
+
+    print("=== SINCRONIZACION DE POSICIONES ===")
 
     positions = trading_client.get_all_positions()
 
@@ -135,17 +137,78 @@ def main():
             break
 
     if existing_position is not None:
-        print("=== PROTECCION DE POSICION ===")
+
+        qty = int(float(existing_position.qty))
+        avg_entry = float(existing_position.avg_entry_price)
+        current_price = float(existing_position.current_price)
+        unrealized_pl = float(existing_position.unrealized_pl)
+
+        print(f"Posicion encontrada: {SYMBOL}")
+        print(f"Cantidad: {qty}")
+        print(f"Precio promedio: ${avg_entry:.2f}")
+        print(f"Precio actual: ${current_price:.2f}")
+        print(f"P/L no realizado: ${unrealized_pl:.2f}")
+
+        # =========================
+        # BUSCAR EN DATABASE
+        # =========================
+
+        db_position = get_open_position_event(SYMBOL)
+
+        if db_position is None:
+
+            print()
+            print("La posicion existe en Alpaca")
+            print("pero no estaba registrada en nuestra DB.")
+            print("SINCRONIZANDO...")
+
+            synced_event_id = log_event(
+                symbol=SYMBOL,
+                signal="COMPRAR",
+                entry_price=avg_entry,
+                stop_price=0.0,
+                position_size=qty,
+                status="POSITION_OPEN",
+                profit_loss=0.0,
+                order_id=None,
+                client_order_id=None
+            )
+
+            print(
+                f"Posicion sincronizada. "
+                f"Evento DB: #{synced_event_id}"
+            )
+
+        else:
+
+            print()
+            print(
+                f"Posicion ya registrada en DB. "
+                f"Evento #{db_position['id']}"
+            )
+
+        print()
+        print("==============================================")
+        print("PROTECCION DE POSICION")
+        print("==============================================")
         print(f"Ya existe una posicion en {SYMBOL}")
-        print(f"Cantidad: {existing_position.qty}")
-        print(f"Precio promedio: ${float(existing_position.avg_entry_price):.2f}")
-        print(f"Ganancia/perdida: ${float(existing_position.unrealized_pl):.2f}")
+        print(f"Cantidad: {qty}")
+        print(f"Precio promedio: ${avg_entry:.2f}")
+        print(f"Ganancia/perdida: ${unrealized_pl:.2f}")
         print("NO SE ENVIARA OTRA COMPRA")
         print("==============================================")
+
         return
 
+    # ==================================================
+    # NO EXISTE POSICIÓN
+    # ==================================================
+
+    print("No existe una posicion abierta en", SYMBOL)
+    print()
+
     # =========================
-    # PROTECCION:
+    # PROTECCIÓN:
     # ORDEN PENDIENTE
     # =========================
 
@@ -160,13 +223,16 @@ def main():
     )
 
     for order in open_orders:
+
         if order.symbol == SYMBOL:
+
             print("=== PROTECCION DE ORDEN ===")
             print(f"Ya existe una orden pendiente para {SYMBOL}")
             print(f"ID: {order.id}")
             print(f"Estado: {order.status}")
             print("NO SE ENVIARA OTRA ORDEN")
             print("==============================================")
+
             return
 
     # =========================
@@ -199,8 +265,10 @@ def main():
     print()
 
     if len(closes) < 20:
+
         print("DATOS INSUFICIENTES")
         print("NO SE GENERA SEÑAL")
+
         return
 
     # =========================
@@ -245,11 +313,13 @@ def main():
     # =========================
 
     if signal != "COMPRAR":
+
         print("=== EJECUCION ===")
         print(f"Señal: {signal}")
         print("Esta version solo abre posiciones LONG.")
         print("NO SE ENVIA NINGUNA ORDEN")
         print("==============================================")
+
         return
 
     # =========================
@@ -280,13 +350,15 @@ def main():
     print()
 
     if not approved:
+
         print("RISK MANAGER RECHAZO LA OPERACION")
         print("NO SE ENVIA NINGUNA ORDEN")
         print("==============================================")
+
         return
 
     # =========================
-    # TAMAÑO DE POSICION
+    # TAMAÑO DE POSICIÓN
     # =========================
 
     position_size = calculate_position_size(
@@ -296,13 +368,18 @@ def main():
     )
 
     if position_size <= 0:
+
         print("TAMAÑO DE POSICION INVALIDO")
         print("NO SE ENVIA NINGUNA ORDEN")
+
         return
 
     print("=== POSICION ===")
     print(f"Acciones: {position_size}")
-    print(f"Riesgo por accion: ${abs(current_price - stop_price):.2f}")
+    print(
+        f"Riesgo por accion: "
+        f"${abs(current_price - stop_price):.2f}"
+    )
     print()
 
     # =========================
@@ -352,6 +429,7 @@ def main():
         print("==============================================")
         print(str(error))
         print("NO SE REGISTRA COMO EJECUTADA")
+
         return
 
     # =========================
@@ -465,10 +543,13 @@ def main():
     saved_event = get_event_by_order_id(order_id)
 
     if saved_event:
+
         print(f"Evento encontrado: #{saved_event['id']}")
         print(f"Estado: {saved_event['status']}")
         print(f"Order ID: {saved_event['order_id']}")
+
     else:
+
         print("No se encontro el evento en la base de datos.")
 
     print()
@@ -477,6 +558,7 @@ def main():
     print("NO ES DINERO REAL")
     print("STOP LOSS ASOCIADO A LA ORDEN")
     print()
+
     print("==============================================")
     print("          CICLO COMPLETADO")
     print("==============================================")
