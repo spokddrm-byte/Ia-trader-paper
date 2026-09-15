@@ -122,3 +122,229 @@ def log_event(
 
 # =========================
 # ACTUALIZAR EVENTO
+# =========================
+
+def update_event(
+    event_id,
+    status=None,
+    profit_loss=None,
+    order_id=None,
+    client_order_id=None
+):
+    connection = get_connection()
+
+    updates = []
+    values = []
+
+    if status is not None:
+        updates.append("status = ?")
+        values.append(status)
+
+    if profit_loss is not None:
+        updates.append("profit_loss = ?")
+        values.append(float(profit_loss))
+
+    if order_id is not None:
+        updates.append("order_id = ?")
+        values.append(str(order_id))
+
+    if client_order_id is not None:
+        updates.append("client_order_id = ?")
+        values.append(str(client_order_id))
+
+    if not updates:
+        connection.close()
+        return False
+
+    values.append(int(event_id))
+
+    connection.execute(
+        f"""
+        UPDATE trade_events
+        SET {", ".join(updates)}
+        WHERE id = ?
+        """,
+        values
+    )
+
+    connection.commit()
+    connection.close()
+
+    return True
+
+
+# =========================
+# BUSCAR EVENTO POR ORDEN
+# =========================
+
+def get_event_by_order_id(order_id):
+    connection = get_connection()
+
+    row = connection.execute("""
+        SELECT *
+        FROM trade_events
+        WHERE order_id = ?
+        ORDER BY id DESC
+        LIMIT 1
+    """, (str(order_id),)).fetchone()
+
+    connection.close()
+
+    return dict(row) if row else None
+
+
+# =========================
+# EVENTOS DE HOY
+# =========================
+
+def get_today_events():
+    today = datetime.now(timezone.utc).date().isoformat()
+
+    connection = get_connection()
+
+    rows = connection.execute("""
+        SELECT *
+        FROM trade_events
+        WHERE timestamp LIKE ?
+        ORDER BY id DESC
+    """, (f"{today}%",)).fetchall()
+
+    connection.close()
+
+    return [dict(row) for row in rows]
+
+
+# =========================
+# OPERACIONES EJECUTADAS
+# =========================
+
+def get_today_trade_count():
+    events = get_today_events()
+
+    return sum(
+        1
+        for event in events
+        if event["status"] in [
+            "FILLED",
+            "POSITION_OPEN",
+            "CLOSED",
+            "STOPPED"
+        ]
+    )
+
+
+# =========================
+# PÉRDIDA DEL DÍA
+# =========================
+
+def get_today_loss():
+    events = get_today_events()
+
+    total_loss = 0.0
+
+    for event in events:
+        profit_loss = float(event["profit_loss"])
+
+        if profit_loss < 0:
+            total_loss += abs(profit_loss)
+
+    return total_loss
+
+
+# =========================
+# RESULTADO DEL DÍA
+# =========================
+
+def get_today_profit_loss():
+    events = get_today_events()
+
+    return sum(
+        float(event["profit_loss"])
+        for event in events
+        if event["status"] in [
+            "CLOSED",
+            "STOPPED"
+        ]
+    )
+
+
+# =========================
+# BUSCAR POSICIÓN ABIERTA
+# =========================
+
+def get_open_position_event(symbol):
+    connection = get_connection()
+
+    row = connection.execute("""
+        SELECT *
+        FROM trade_events
+        WHERE symbol = ?
+        AND status IN (
+            'FILLED',
+            'POSITION_OPEN'
+        )
+        ORDER BY id DESC
+        LIMIT 1
+    """, (symbol,)).fetchone()
+
+    connection.close()
+
+    return dict(row) if row else None
+
+
+# =========================
+# CERRAR POSICIÓN EN DB
+# =========================
+
+def close_position_event(event_id, profit_loss):
+    connection = get_connection()
+
+    connection.execute("""
+        UPDATE trade_events
+        SET status = 'CLOSED',
+            profit_loss = ?
+        WHERE id = ?
+    """, (
+        float(profit_loss),
+        int(event_id)
+    ))
+
+    connection.commit()
+    connection.close()
+
+    return True
+
+
+# =========================
+# PRUEBA
+# =========================
+
+if __name__ == "__main__":
+
+    print("=== AI TRADER - DATABASE ===")
+
+    initialize_database()
+
+    event_id = log_event(
+        symbol="AAPL",
+        signal="COMPRAR",
+        entry_price=333.00,
+        stop_price=323.01,
+        position_size=100,
+        status="SIGNAL_ONLY",
+        profit_loss=0.0,
+        order_id=None,
+        client_order_id=None
+    )
+
+    print(f"Evento registrado: #{event_id}")
+
+    events = get_today_events()
+
+    print(f"Eventos de hoy: {len(events)}")
+    print(f"Operaciones ejecutadas: {get_today_trade_count()}")
+    print(f"Pérdida del día: ${get_today_loss():.2f}")
+    print(f"Resultado del día: ${get_today_profit_loss():.2f}")
+
+    print()
+    print("BASE DE DATOS FUNCIONANDO 👽")
