@@ -9,8 +9,8 @@ from alpaca.data.enums import DataFeed
 
 
 # ============================================================
-# AI TRADER — MULTI BACKTEST V5
-# ROLLING OUT-OF-SAMPLE / WALK-FORWARD
+# AI TRADER — MULTI BACKTEST V6
+# WALK-FORWARD REAL / ROLLING OUT-OF-SAMPLE
 # SOLO BACKTEST — NO ENVIA ORDENES
 # ============================================================
 
@@ -26,10 +26,15 @@ INITIAL_CAPITAL = 100000.0
 
 RISK_PER_TRADE = 0.01
 STOP_PERCENT = 0.03
+
 SLIPPAGE_PERCENT = 0.0005
 COMMISSION_PER_SHARE = 0.01
 
+# Días iniciales necesarios para que los indicadores
+# tengan suficiente historial.
 WARMUP_DAYS = 252
+
+# Cada bloque OOS tendrá aproximadamente 63 días.
 TEST_WINDOW_DAYS = 63
 
 
@@ -55,11 +60,15 @@ def ema(values, period):
         return None
 
     multiplier = 2 / (period + 1)
-    average = sum(values[:period]) / period
+
+    average = sum(
+        values[:period]
+    ) / period
 
     for price in values[period:]:
         average = (
-            (price - average) * multiplier
+            (price - average)
+            * multiplier
         ) + average
 
     return average
@@ -73,51 +82,77 @@ def rsi(values, period=14):
     losses = []
 
     for i in range(1, len(values)):
-        change = values[i] - values[i - 1]
+
+        change = (
+            values[i]
+            - values[i - 1]
+        )
 
         if change > 0:
             gains.append(change)
             losses.append(0.0)
+
         else:
             gains.append(0.0)
             losses.append(abs(change))
 
-    average_gain = sum(gains[:period]) / period
-    average_loss = sum(losses[:period]) / period
+    average_gain = (
+        sum(gains[:period])
+        / period
+    )
 
-    for i in range(period, len(gains)):
+    average_loss = (
+        sum(losses[:period])
+        / period
+    )
+
+    for i in range(
+        period,
+        len(gains)
+    ):
+
         average_gain = (
             (
-                average_gain * (period - 1)
+                average_gain
+                * (period - 1)
                 + gains[i]
-            ) / period
+            )
+            / period
         )
 
         average_loss = (
             (
-                average_loss * (period - 1)
+                average_loss
+                * (period - 1)
                 + losses[i]
-            ) / period
+            )
+            / period
         )
 
     if average_loss == 0:
         return 100.0
 
-    rs = average_gain / average_loss
+    relative_strength = (
+        average_gain
+        / average_loss
+    )
 
     return 100.0 - (
-        100.0 / (1.0 + rs)
+        100.0
+        / (1.0 + relative_strength)
     )
 
 
 # ============================================================
-# DATOS
+# LIMPIEZA DE DATOS
 # ============================================================
 
 def clean_bars(symbol_bars):
+
     data = []
 
     for bar in symbol_bars:
+
         timestamp = bar.timestamp
 
         open_price = float(bar.open)
@@ -159,7 +194,7 @@ def clean_bars(symbol_bars):
         )
 
     data.sort(
-        key=lambda x: x[0]
+        key=lambda item: item[0]
     )
 
     return data
@@ -170,101 +205,159 @@ def clean_bars(symbol_bars):
 # ============================================================
 
 def max_drawdown(equity):
+
     if not equity:
         return 0.0, 0.0
 
     peak = equity[0]
+
     max_dd = 0.0
-    max_dd_pct = 0.0
+    max_dd_percent = 0.0
 
     for value in equity:
+
         if value > peak:
             peak = value
 
         if peak <= 0:
             continue
 
-        dd = peak - value
-        dd_pct = (dd / peak) * 100.0
+        drawdown = (
+            peak - value
+        )
 
-        max_dd = max(max_dd, dd)
-        max_dd_pct = max(max_dd_pct, dd_pct)
+        drawdown_percent = (
+            drawdown
+            / peak
+            * 100.0
+        )
 
-    return max_dd, max_dd_pct
+        max_dd = max(
+            max_dd,
+            drawdown
+        )
+
+        max_dd_percent = max(
+            max_dd_percent,
+            drawdown_percent
+        )
+
+    return (
+        max_dd,
+        max_dd_percent
+    )
 
 
 def sharpe(equity):
+
     if len(equity) < 2:
         return 0.0
 
     returns = []
 
-    for i in range(1, len(equity)):
+    for i in range(
+        1,
+        len(equity)
+    ):
+
         previous = equity[i - 1]
         current = equity[i]
 
         if previous <= 0:
             continue
 
+        daily_return = (
+            current - previous
+        ) / previous
+
         returns.append(
-            (current - previous) / previous
+            daily_return
         )
 
     if len(returns) < 2:
         return 0.0
 
-    average = sum(returns) / len(returns)
+    average = (
+        sum(returns)
+        / len(returns)
+    )
 
-    variance = sum(
-        (x - average) ** 2
-        for x in returns
-    ) / (len(returns) - 1)
+    variance = (
+        sum(
+            (value - average) ** 2
+            for value in returns
+        )
+        / (len(returns) - 1)
+    )
 
-    deviation = math.sqrt(variance)
+    deviation = math.sqrt(
+        variance
+    )
 
     if deviation == 0:
         return 0.0
 
     return (
-        average / deviation
-    ) * math.sqrt(252)
+        average
+        / deviation
+        * math.sqrt(252)
+    )
 
 
 def profit_factor(trades):
-    profit = sum(
-        x for x in trades if x > 0
+
+    gross_profit = sum(
+        trade
+        for trade in trades
+        if trade > 0
     )
 
-    loss = abs(
-        sum(x for x in trades if x < 0)
+    gross_loss = abs(
+        sum(
+            trade
+            for trade in trades
+            if trade < 0
+        )
     )
 
-    if loss == 0:
-        if profit > 0:
+    if gross_loss == 0:
+
+        if gross_profit > 0:
             return float("inf")
+
         return 0.0
 
-    return profit / loss
+    return (
+        gross_profit
+        / gross_loss
+    )
 
 
 def losing_streak(trades):
+
     current = 0
     maximum = 0
 
     for trade in trades:
+
         if trade < 0:
+
             current += 1
+
             maximum = max(
                 maximum,
                 current
             )
+
         else:
+
             current = 0
 
     return maximum
 
 
 def format_pf(value):
+
     if math.isinf(value):
         return "INF"
 
@@ -272,72 +365,50 @@ def format_pf(value):
 
 
 # ============================================================
-# BACKTEST
+# SIMULADOR DE UNA VENTANA
 # ============================================================
 
-def run_backtest(data):
-
-    if len(data) < WARMUP_DAYS + 50:
-        return None
-
-    dates = [
-        x[0] for x in data
-    ]
-
-    opens = [
-        x[1] for x in data
-    ]
-
-    highs = [
-        x[2] for x in data
-    ]
-
-    lows = [
-        x[3] for x in data
-    ]
-
-    closes = [
-        x[4] for x in data
-    ]
-
-    capital = INITIAL_CAPITAL
-
-    position = 0
-    entry_price = 0.0
-    stop_price = 0.0
-
-    pending_entry = False
+def process_window(
+    data,
+    start_index,
+    end_index,
+    capital,
+    position,
+    entry_price,
+    stop_price,
+    pending_entry
+):
 
     trades = []
-    oos_trades = []
-
     equity_curve = []
-    oos_equity_curve = []
 
-    total_commissions = 0.0
-    oos_commissions = 0.0
+    commissions = 0.0
 
     wins = 0
     losses = 0
 
-    oos_wins = 0
-    oos_losses = 0
-
-    oos_start = min(
-        WARMUP_DAYS,
-        len(data) - 1
-    )
-
-    # ========================================================
-    # HISTORIAL
-    # ========================================================
+    closes = [
+        row[4]
+        for row in data
+    ]
 
     for i in range(
-        20,
-        len(closes)
+        start_index,
+        end_index
     ):
 
-        price = closes[i]
+        timestamp = data[i][0]
+        open_price = data[i][1]
+        high = data[i][2]
+        low = data[i][3]
+        close = data[i][4]
+
+        del timestamp
+        del high
+
+        # ====================================================
+        # INDICADORES
+        # ====================================================
 
         history = closes[:i + 1]
 
@@ -355,19 +426,26 @@ def run_backtest(data):
             ema20 is None
             or rsi14 is None
         ):
-            equity_curve.append(
-                capital
-            )
 
-            if i >= oos_start:
-                oos_equity_curve.append(
+            if position > 0:
+
+                equity = (
                     capital
+                    + close * position
                 )
+
+            else:
+
+                equity = capital
+
+            equity_curve.append(
+                equity
+            )
 
             continue
 
         # ====================================================
-        # ENTRADA AL OPEN
+        # ENTRADA PENDIENTE
         # ====================================================
 
         if (
@@ -375,13 +453,16 @@ def run_backtest(data):
             and pending_entry
         ):
 
-            entry_price_execution = (
-                opens[i]
-                * (1 + SLIPPAGE_PERCENT)
+            execution_price = (
+                open_price
+                * (
+                    1
+                    + SLIPPAGE_PERCENT
+                )
             )
 
             stop_distance = (
-                entry_price_execution
+                execution_price
                 * STOP_PERCENT
             )
 
@@ -390,18 +471,32 @@ def run_backtest(data):
                 * RISK_PER_TRADE
             )
 
-            shares_risk = int(
-                risk_amount
-                / stop_distance
+            if stop_distance > 0:
+
+                shares_risk = int(
+                    risk_amount
+                    / stop_distance
+                )
+
+            else:
+
+                shares_risk = 0
+
+            share_cost = (
+                execution_price
+                + COMMISSION_PER_SHARE
             )
 
-            shares_capital = int(
-                capital
-                / (
-                    entry_price_execution
-                    + COMMISSION_PER_SHARE
+            if share_cost > 0:
+
+                shares_capital = int(
+                    capital
+                    / share_cost
                 )
-            )
+
+            else:
+
+                shares_capital = 0
 
             shares = min(
                 shares_risk,
@@ -416,7 +511,7 @@ def run_backtest(data):
                 )
 
                 total_cost = (
-                    entry_price_execution
+                    execution_price
                     * shares
                     + entry_commission
                 )
@@ -428,22 +523,20 @@ def run_backtest(data):
                     position = shares
 
                     entry_price = (
-                        entry_price_execution
+                        execution_price
                     )
 
                     stop_price = (
                         entry_price
-                        * (1 - STOP_PERCENT)
+                        * (
+                            1
+                            - STOP_PERCENT
+                        )
                     )
 
-                    total_commissions += (
+                    commissions += (
                         entry_commission
                     )
-
-                    if i >= oos_start:
-                        oos_commissions += (
-                            entry_commission
-                        )
 
             pending_entry = False
 
@@ -454,42 +547,64 @@ def run_backtest(data):
         if position > 0:
 
             exit_reason = None
-            execution_price = None
+            exit_price = None
 
+            # -----------------------------------------------
             # STOP POR GAP
-            if opens[i] <= stop_price:
+            # -----------------------------------------------
+
+            if open_price <= stop_price:
 
                 exit_reason = "STOP_GAP"
 
-                execution_price = (
-                    opens[i]
-                    * (1 - SLIPPAGE_PERCENT)
+                exit_price = (
+                    open_price
+                    * (
+                        1
+                        - SLIPPAGE_PERCENT
+                    )
                 )
 
+            # -----------------------------------------------
             # STOP NORMAL
-            elif lows[i] <= stop_price:
+            # -----------------------------------------------
+
+            elif low <= stop_price:
 
                 exit_reason = "STOP"
 
-                execution_price = (
+                exit_price = (
                     stop_price
-                    * (1 - SLIPPAGE_PERCENT)
+                    * (
+                        1
+                        - SLIPPAGE_PERCENT
+                    )
                 )
 
-            # SALIDA EMA
-            elif price < ema20:
+            # -----------------------------------------------
+            # SALIDA POR EMA
+            # -----------------------------------------------
+
+            elif close < ema20:
 
                 exit_reason = "EMA"
 
-                execution_price = (
-                    price
-                    * (1 - SLIPPAGE_PERCENT)
+                exit_price = (
+                    close
+                    * (
+                        1
+                        - SLIPPAGE_PERCENT
+                    )
                 )
+
+            # -----------------------------------------------
+            # EJECUTAR SALIDA
+            # -----------------------------------------------
 
             if exit_reason is not None:
 
                 gross_result = (
-                    execution_price
+                    exit_price
                     - entry_price
                 ) * position
 
@@ -504,7 +619,7 @@ def run_backtest(data):
                 )
 
                 capital += (
-                    execution_price
+                    exit_price
                     * position
                 )
 
@@ -516,7 +631,7 @@ def run_backtest(data):
                     pnl
                 )
 
-                total_commissions += (
+                commissions += (
                     exit_commission
                 )
 
@@ -525,27 +640,14 @@ def run_backtest(data):
                 else:
                     losses += 1
 
-                if i >= oos_start:
-
-                    oos_trades.append(
-                        pnl
-                    )
-
-                    oos_commissions += (
-                        exit_commission
-                    )
-
-                    if pnl >= 0:
-                        oos_wins += 1
-                    else:
-                        oos_losses += 1
-
                 position = 0
+
                 entry_price = 0.0
+
                 stop_price = 0.0
 
         # ====================================================
-        # NUEVA SEÑAL AL CIERRE
+        # NUEVA SEÑAL
         # ====================================================
 
         if (
@@ -554,11 +656,12 @@ def run_backtest(data):
         ):
 
             signal = (
-                price > ema20
+                close > ema20
                 and rsi14 < 70
             )
 
             if signal:
+
                 pending_entry = True
 
         # ====================================================
@@ -568,7 +671,7 @@ def run_backtest(data):
         if position > 0:
 
             market_value = (
-                closes[i]
+                close
                 * position
             )
 
@@ -585,21 +688,253 @@ def run_backtest(data):
             equity
         )
 
-        if i >= oos_start:
+    return {
+        "capital": capital,
+        "position": position,
+        "entry_price": entry_price,
+        "stop_price": stop_price,
+        "pending_entry": pending_entry,
+        "trades": trades,
+        "equity": equity_curve,
+        "commissions": commissions,
+        "wins": wins,
+        "losses": losses
+    }
 
-            oos_equity_curve.append(
-                equity
-            )
+
+# ============================================================
+# WALK-FORWARD REAL
+# ============================================================
+
+def run_walk_forward(data):
+
+    minimum_required = (
+        WARMUP_DAYS
+        + TEST_WINDOW_DAYS
+        + 20
+    )
+
+    if len(data) < minimum_required:
+        return None
+
+    dates = [
+        row[0]
+        for row in data
+    ]
+
+    closes = [
+        row[4]
+        for row in data
+    ]
 
     # ========================================================
-    # CIERRE FINAL
+    # ESTADO GLOBAL
+    # ========================================================
+
+    capital = INITIAL_CAPITAL
+
+    position = 0
+    entry_price = 0.0
+    stop_price = 0.0
+    pending_entry = False
+
+    all_trades = []
+    all_equity = []
+
+    total_commissions = 0.0
+
+    total_wins = 0
+    total_losses = 0
+
+    windows = []
+
+    # ========================================================
+    # PRIMER BLOQUE OOS
+    # ========================================================
+
+    window_start = WARMUP_DAYS
+
+    window_number = 1
+
+    while window_start < len(data):
+
+        window_end = min(
+            window_start
+            + TEST_WINDOW_DAYS,
+            len(data)
+        )
+
+        # -----------------------------------------------
+        # IMPORTANTE:
+        # Antes de cada bloque OOS, los indicadores
+        # utilizan únicamente información disponible
+        # hasta ese momento.
+        # -----------------------------------------------
+
+        starting_capital = capital
+
+        result = process_window(
+            data,
+            window_start,
+            window_end,
+            capital,
+            position,
+            entry_price,
+            stop_price,
+            pending_entry
+        )
+
+        capital = result["capital"]
+
+        position = result["position"]
+
+        entry_price = result["entry_price"]
+
+        stop_price = result["stop_price"]
+
+        pending_entry = result["pending_entry"]
+
+        window_trades = result["trades"]
+
+        window_equity = result["equity"]
+
+        window_commissions = (
+            result["commissions"]
+        )
+
+        window_wins = result["wins"]
+
+        window_losses = result["losses"]
+
+        all_trades.extend(
+            window_trades
+        )
+
+        all_equity.extend(
+            window_equity
+        )
+
+        total_commissions += (
+            window_commissions
+        )
+
+        total_wins += (
+            window_wins
+        )
+
+        total_losses += (
+            window_losses
+        )
+
+        # -----------------------------------------------
+        # METRICAS DE LA VENTANA
+        # -----------------------------------------------
+
+        if starting_capital > 0:
+
+            window_return = (
+                (
+                    capital
+                    / starting_capital
+                ) - 1
+            ) * 100
+
+        else:
+
+            window_return = 0.0
+
+        window_pf = profit_factor(
+            window_trades
+        )
+
+        _, window_dd = (
+            max_drawdown(
+                window_equity
+            )
+        )
+
+        window_sharpe = sharpe(
+            window_equity
+        )
+
+        window_win_rate = (
+            window_wins
+            / len(window_trades)
+            * 100
+            if window_trades
+            else 0.0
+        )
+
+        windows.append(
+            {
+                "number":
+                    window_number,
+
+                "start":
+                    dates[window_start]
+                    .strftime(
+                        "%Y-%m-%d"
+                    ),
+
+                "end":
+                    dates[window_end - 1]
+                    .strftime(
+                        "%Y-%m-%d"
+                    ),
+
+                "starting_capital":
+                    starting_capital,
+
+                "ending_capital":
+                    capital,
+
+                "return":
+                    window_return,
+
+                "trades":
+                    len(window_trades),
+
+                "wins":
+                    window_wins,
+
+                "losses":
+                    window_losses,
+
+                "win_rate":
+                    window_win_rate,
+
+                "profit_factor":
+                    window_pf,
+
+                "drawdown":
+                    window_dd,
+
+                "sharpe":
+                    window_sharpe,
+
+                "commissions":
+                    window_commissions
+            }
+        )
+
+        window_number += 1
+
+        window_start = window_end
+
+    # ========================================================
+    # CIERRE FINAL DE POSICION
     # ========================================================
 
     if position > 0:
 
+        final_close = closes[-1]
+
         final_price = (
-            closes[-1]
-            * (1 - SLIPPAGE_PERCENT)
+            final_close
+            * (
+                1
+                - SLIPPAGE_PERCENT
+            )
         )
 
         gross_result = (
@@ -626,7 +961,7 @@ def run_backtest(data):
             exit_commission
         )
 
-        trades.append(
+        all_trades.append(
             pnl
         )
 
@@ -635,40 +970,14 @@ def run_backtest(data):
         )
 
         if pnl >= 0:
-            wins += 1
+            total_wins += 1
         else:
-            losses += 1
-
-        if (
-            len(data) - 1
-            >= oos_start
-        ):
-
-            oos_trades.append(
-                pnl
-            )
-
-            oos_commissions += (
-                exit_commission
-            )
-
-            if pnl >= 0:
-                oos_wins += 1
-            else:
-                oos_losses += 1
+            total_losses += 1
 
         position = 0
 
-        equity_curve.append(
-            capital
-        )
-
-        oos_equity_curve.append(
-            capital
-        )
-
     # ========================================================
-    # METRICAS TOTALES
+    # METRICAS GLOBALES
     # ========================================================
 
     final_capital = capital
@@ -680,30 +989,36 @@ def run_backtest(data):
         ) - 1
     ) * 100
 
-    total_trades = len(trades)
+    total_trades = len(
+        all_trades
+    )
 
-    win_rate = (
-        wins / total_trades * 100
+    total_win_rate = (
+        total_wins
+        / total_trades
+        * 100
         if total_trades
         else 0.0
     )
 
-    pf = profit_factor(
-        trades
+    total_pf = profit_factor(
+        all_trades
     )
 
-    dd_dollars, dd_percent = (
+    total_dd_dollars, total_dd = (
         max_drawdown(
-            equity_curve
+            all_equity
         )
     )
 
     total_sharpe = sharpe(
-        equity_curve
+        all_equity
     )
 
-    streak = losing_streak(
-        trades
+    total_losing_streak = (
+        losing_streak(
+            all_trades
+        )
     )
 
     # ========================================================
@@ -741,73 +1056,51 @@ def run_backtest(data):
     ) * 100
 
     # ========================================================
-    # OOS
+    # CONSISTENCIA DE VENTANAS
     # ========================================================
 
-    if oos_equity_curve:
+    positive_windows = sum(
+        1
+        for window in windows
+        if window["return"] > 0
+    )
 
-        oos_initial = (
-            oos_equity_curve[0]
-        )
+    negative_windows = sum(
+        1
+        for window in windows
+        if window["return"] < 0
+    )
 
-        oos_final = (
-            oos_equity_curve[-1]
+    flat_windows = (
+        len(windows)
+        - positive_windows
+        - negative_windows
+    )
+
+    if windows:
+
+        average_window_return = (
+            sum(
+                window["return"]
+                for window in windows
+            )
+            / len(windows)
         )
 
     else:
 
-        oos_initial = INITIAL_CAPITAL
-        oos_final = INITIAL_CAPITAL
-
-    if oos_initial > 0:
-
-        oos_return = (
-            (
-                oos_final
-                / oos_initial
-            ) - 1
-        ) * 100
-
-    else:
-
-        oos_return = 0.0
-
-    oos_count = len(
-        oos_trades
-    )
-
-    oos_win_rate = (
-        oos_wins
-        / oos_count
-        * 100
-        if oos_count
-        else 0.0
-    )
-
-    oos_pf = profit_factor(
-        oos_trades
-    )
-
-    oos_dd_dollars, oos_dd_percent = (
-        max_drawdown(
-            oos_equity_curve
-        )
-    )
-
-    oos_sharpe = sharpe(
-        oos_equity_curve
-    )
-
-    oos_streak = losing_streak(
-        oos_trades
-    )
+        average_window_return = 0.0
 
     return {
         "start_date":
-            dates[0].strftime("%Y-%m-%d"),
+            dates[0].strftime(
+                "%Y-%m-%d"
+            ),
 
         "end_date":
-            dates[-1].strftime("%Y-%m-%d"),
+            dates[-1].strftime(
+                "%Y-%m-%d"
+            ),
 
         "final_capital":
             final_capital,
@@ -828,80 +1121,49 @@ def run_backtest(data):
             total_trades,
 
         "wins":
-            wins,
+            total_wins,
 
         "losses":
-            losses,
+            total_losses,
 
         "win_rate":
-            win_rate,
+            total_win_rate,
 
         "profit_factor":
-            pf,
+            total_pf,
 
         "drawdown":
-            dd_percent,
+            total_dd,
 
         "drawdown_dollars":
-            dd_dollars,
+            total_dd_dollars,
 
         "sharpe":
             total_sharpe,
 
         "losing_streak":
-            streak,
+            total_losing_streak,
 
         "commissions":
             total_commissions,
 
-        "oos_start_date":
-            dates[oos_start].strftime(
-                "%Y-%m-%d"
-            ),
+        "windows":
+            windows,
 
-        "oos_end_date":
-            dates[-1].strftime(
-                "%Y-%m-%d"
-            ),
+        "total_windows":
+            len(windows),
 
-        "oos_initial":
-            oos_initial,
+        "positive_windows":
+            positive_windows,
 
-        "oos_final":
-            oos_final,
+        "negative_windows":
+            negative_windows,
 
-        "oos_return":
-            oos_return,
+        "flat_windows":
+            flat_windows,
 
-        "oos_trades":
-            oos_count,
-
-        "oos_wins":
-            oos_wins,
-
-        "oos_losses":
-            oos_losses,
-
-        "oos_win_rate":
-            oos_win_rate,
-
-        "oos_profit_factor":
-            oos_pf,
-
-        "oos_drawdown":
-            oos_dd_percent,
-
-        "oos_drawdown_dollars":
-            oos_dd_dollars,
-
-        "oos_sharpe":
-            oos_sharpe,
-
-        "oos_losing_streak":
-            oos_streak,
-
-        "oos_commissions":
-            oos_commissions
+        "average_window_return":
+            average_window_return
     }
 
 
@@ -911,12 +1173,14 @@ def run_backtest(data):
 
 print()
 print("==============================================")
-print("       AI TRADER — MULTI BACKTEST V5")
+print("       AI TRADER — MULTI BACKTEST V6")
 print("==============================================")
 print()
-print("ROLLING OUT-OF-SAMPLE / WALK-FORWARD")
+print("WALK-FORWARD REAL / ROLLING OOS")
 print(f"WARMUP: {WARMUP_DAYS} días")
-print(f"VENTANA OOS: {TEST_WINDOW_DAYS} días")
+print(
+    f"VENTANA OOS: {TEST_WINDOW_DAYS} días"
+)
 print()
 print("DATOS AJUSTADOS: SPLITS + DIVIDENDOS")
 print("ENTRADA: OPEN DEL DÍA SIGUIENTE")
@@ -928,6 +1192,7 @@ print("NO SE ENVIAN ORDENES")
 print()
 
 results = []
+
 
 for symbol in SYMBOLS:
 
@@ -973,7 +1238,9 @@ for symbol in SYMBOLS:
             )
 
             if len(data) < (
-                WARMUP_DAYS + 50
+                WARMUP_DAYS
+                + TEST_WINDOW_DAYS
+                + 20
             ):
 
                 print(
@@ -983,7 +1250,7 @@ for symbol in SYMBOLS:
 
                 continue
 
-            result = run_backtest(
+            result = run_walk_forward(
                 data
             )
 
@@ -1005,21 +1272,27 @@ for symbol in SYMBOLS:
 
             print(
                 f"  {period_name}: "
-                f"TOTAL {result['return']:.2f}% | "
-                f"B&H {result['buy_hold']:.2f}% | "
-                f"OOS {result['oos_return']:.2f}% | "
-                f"OOS trades "
-                f"{result['oos_trades']} | "
-                f"OOS PF "
-                f"{format_pf(result['oos_profit_factor'])} | "
-                f"OOS DD "
-                f"{result['oos_drawdown']:.2f}%"
+                f"TOTAL "
+                f"{result['return']:.2f}% | "
+                f"B&H "
+                f"{result['buy_hold']:.2f}% | "
+                f"VENTANAS "
+                f"{result['total_windows']} | "
+                f"POSITIVAS "
+                f"{result['positive_windows']} | "
+                f"NEGATIVAS "
+                f"{result['negative_windows']}"
             )
 
             print(
-                f"      OOS: "
-                f"{result['oos_start_date']} -> "
-                f"{result['oos_end_date']}"
+                f"      OOS acumulado: "
+                f"{result['return']:.2f}% | "
+                f"PF "
+                f"{format_pf(result['profit_factor'])} | "
+                f"DD "
+                f"{result['drawdown']:.2f}% | "
+                f"Sharpe "
+                f"{result['sharpe']:.2f}"
             )
 
         except Exception as error:
@@ -1036,21 +1309,22 @@ for symbol in SYMBOLS:
 
 
 # ============================================================
-# RESUMEN
+# RESULTADOS GLOBALES
 # ============================================================
 
 print()
 print("==============================================")
-print("             RESULTADOS V5")
+print("             RESULTADOS V6")
 print("==============================================")
 print()
 
 print(
-    "ACTIVO | PERIODO | TOTAL | B&H | OOS | "
-    "OOS TRADES | WIN% | PF | DD | SHARPE"
+    "ACTIVO | PERIODO | TOTAL | B&H | "
+    "VENTANAS | + | - | WIN% | PF | DD | SHARPE"
 )
 
-print("-" * 110)
+print("-" * 115)
+
 
 for result in results:
 
@@ -1059,24 +1333,26 @@ for result in results:
         f"{result['period']:7} | "
         f"{result['return']:6.2f}% | "
         f"{result['buy_hold']:6.2f}% | "
-        f"{result['oos_return']:6.2f}% | "
-        f"{result['oos_trades']:10} | "
-        f"{result['oos_win_rate']:5.1f}% | "
-        f"{format_pf(result['oos_profit_factor']):>4} | "
-        f"{result['oos_drawdown']:5.2f}% | "
-        f"{result['oos_sharpe']:6.2f}"
+        f"{result['total_windows']:8} | "
+        f"{result['positive_windows']:1} | "
+        f"{result['negative_windows']:1} | "
+        f"{result['win_rate']:5.1f}% | "
+        f"{format_pf(result['profit_factor']):>4} | "
+        f"{result['drawdown']:5.2f}% | "
+        f"{result['sharpe']:6.2f}"
     )
 
 
 # ============================================================
-# DETALLE OOS
+# DETALLE DE CADA VENTANA
 # ============================================================
 
 print()
 print("==============================================")
-print("              DETALLE OOS")
+print("          VENTANAS WALK-FORWARD")
 print("==============================================")
 print()
+
 
 for result in results:
 
@@ -1085,74 +1361,56 @@ for result in results:
         f"{result['period']}"
     )
 
+    print()
+
+    for window in result["windows"]:
+
+        print(
+            f"  W{window['number']:02d} | "
+            f"{window['start']} -> "
+            f"{window['end']} | "
+            f"{window['return']:7.2f}% | "
+            f"Trades "
+            f"{window['trades']:3} | "
+            f"Win "
+            f"{window['win_rate']:5.1f}% | "
+            f"PF "
+            f"{format_pf(window['profit_factor']):>4} | "
+            f"DD "
+            f"{window['drawdown']:5.2f}% | "
+            f"Sharpe "
+            f"{window['sharpe']:5.2f}"
+        )
+
+    print()
+
     print(
-        f"  Periodo OOS: "
-        f"{result['oos_start_date']} -> "
-        f"{result['oos_end_date']}"
+        f"  Ventanas positivas: "
+        f"{result['positive_windows']}"
     )
 
     print(
-        f"  Capital inicial: "
-        f"${result['oos_initial']:,.2f}"
+        f"  Ventanas negativas: "
+        f"{result['negative_windows']}"
     )
 
     print(
-        f"  Capital final: "
-        f"${result['oos_final']:,.2f}"
-    )
-
-    print(
-        f"  Rendimiento OOS: "
-        f"{result['oos_return']:.2f}%"
-    )
-
-    print(
-        f"  Trades OOS: "
-        f"{result['oos_trades']}"
-    )
-
-    print(
-        f"  Win Rate OOS: "
-        f"{result['oos_win_rate']:.1f}%"
-    )
-
-    print(
-        f"  Profit Factor OOS: "
-        f"{format_pf(result['oos_profit_factor'])}"
-    )
-
-    print(
-        f"  Drawdown OOS: "
-        f"{result['oos_drawdown']:.2f}% "
-        f"(${result['oos_drawdown_dollars']:,.2f})"
-    )
-
-    print(
-        f"  Sharpe OOS: "
-        f"{result['oos_sharpe']:.2f}"
-    )
-
-    print(
-        f"  Racha perdedora OOS: "
-        f"{result['oos_losing_streak']}"
-    )
-
-    print(
-        f"  Comisiones OOS: "
-        f"${result['oos_commissions']:,.2f}"
+        f"  Rendimiento promedio "
+        f"por ventana: "
+        f"{result['average_window_return']:.2f}%"
     )
 
     print()
 
 
 # ============================================================
-# EXPORTAR
+# EXPORTAR RESULTADOS
 # ============================================================
 
 output = []
 
 output.append(
-    "AI TRADER — MULTI BACKTEST V5"
+    "AI TRADER — MULTI BACKTEST V6"
 )
 
 output.append(
@@ -1160,7 +1418,7 @@ output.append(
 )
 
 output.append(
-    "ROLLING OUT-OF-SAMPLE / WALK-FORWARD"
+    "WALK-FORWARD REAL / ROLLING OOS"
 )
 
 output.append(
@@ -1178,13 +1436,18 @@ output.append(
 output.append("")
 
 output.append(
-    "ACTIVO | PERIODO | TOTAL | B&H | OOS | "
-    "OOS TRADES | WIN% | PF | DD | SHARPE"
+    "RESULTADOS V6"
 )
 
 output.append(
-    "-" * 110
+    "ACTIVO | PERIODO | TOTAL | B&H | "
+    "VENTANAS | + | - | WIN% | PF | DD | SHARPE"
 )
+
+output.append(
+    "-" * 115
+)
+
 
 for result in results:
 
@@ -1193,18 +1456,25 @@ for result in results:
         f"{result['period']:7} | "
         f"{result['return']:6.2f}% | "
         f"{result['buy_hold']:6.2f}% | "
-        f"{result['oos_return']:6.2f}% | "
-        f"{result['oos_trades']:10} | "
-        f"{result['oos_win_rate']:5.1f}% | "
-        f"{format_pf(result['oos_profit_factor']):>4} | "
-        f"{result['oos_drawdown']:5.2f}% | "
-        f"{result['oos_sharpe']:6.2f}"
+        f"{result['total_windows']:8} | "
+        f"{result['positive_windows']:1} | "
+        f"{result['negative_windows']:1} | "
+        f"{result['win_rate']:5.1f}% | "
+        f"{format_pf(result['profit_factor']):>4} | "
+        f"{result['drawdown']:5.2f}% | "
+        f"{result['sharpe']:6.2f}"
     )
 
+
 output.append("")
-output.append("DETALLE OOS")
-output.append("==============================================")
+output.append(
+    "VENTANAS WALK-FORWARD"
+)
+output.append(
+    "=============================================="
+)
 output.append("")
+
 
 for result in results:
 
@@ -1213,61 +1483,44 @@ for result in results:
         f"{result['period']}"
     )
 
+    output.append("")
+
+    for window in result["windows"]:
+
+        output.append(
+            f"W{window['number']:02d} | "
+            f"{window['start']} -> "
+            f"{window['end']} | "
+            f"Return "
+            f"{window['return']:.2f}% | "
+            f"Trades "
+            f"{window['trades']} | "
+            f"Win "
+            f"{window['win_rate']:.1f}% | "
+            f"PF "
+            f"{format_pf(window['profit_factor'])} | "
+            f"DD "
+            f"{window['drawdown']:.2f}% | "
+            f"Sharpe "
+            f"{window['sharpe']:.2f}"
+        )
+
+    output.append("")
+
     output.append(
-        f"OOS: "
-        f"{result['oos_start_date']} -> "
-        f"{result['oos_end_date']}"
+        f"Ventanas positivas: "
+        f"{result['positive_windows']}"
     )
 
     output.append(
-        f"Capital inicial: "
-        f"${result['oos_initial']:,.2f}"
+        f"Ventanas negativas: "
+        f"{result['negative_windows']}"
     )
 
     output.append(
-        f"Capital final: "
-        f"${result['oos_final']:,.2f}"
-    )
-
-    output.append(
-        f"Rendimiento OOS: "
-        f"{result['oos_return']:.2f}%"
-    )
-
-    output.append(
-        f"Trades OOS: "
-        f"{result['oos_trades']}"
-    )
-
-    output.append(
-        f"Win Rate OOS: "
-        f"{result['oos_win_rate']:.1f}%"
-    )
-
-    output.append(
-        f"Profit Factor OOS: "
-        f"{format_pf(result['oos_profit_factor'])}"
-    )
-
-    output.append(
-        f"Drawdown OOS: "
-        f"{result['oos_drawdown']:.2f}% "
-        f"(${result['oos_drawdown_dollars']:,.2f})"
-    )
-
-    output.append(
-        f"Sharpe OOS: "
-        f"{result['oos_sharpe']:.2f}"
-    )
-
-    output.append(
-        f"Racha perdedora OOS: "
-        f"{result['oos_losing_streak']}"
-    )
-
-    output.append(
-        f"Comisiones OOS: "
-        f"${result['oos_commissions']:,.2f}"
+        f"Rendimiento promedio "
+        f"por ventana: "
+        f"{result['average_window_return']:.2f}%"
     )
 
     output.append("")
@@ -1276,7 +1529,7 @@ for result in results:
 try:
 
     with open(
-        "backtest_results_v5.txt",
+        "backtest_results_v6.txt",
         "w",
         encoding="utf-8"
     ) as file:
@@ -1290,11 +1543,11 @@ try:
     )
 
     print(
-        "RESULTADOS V5 EXPORTADOS"
+        "RESULTADOS V6 EXPORTADOS"
     )
 
     print(
-        "Archivo: backtest_results_v5.txt"
+        "Archivo: backtest_results_v6.txt"
     )
 
     print(
@@ -1314,6 +1567,6 @@ except Exception as error:
 
 print()
 print("==============================================")
-print("       BACKTEST V5 FINALIZADO")
+print("       BACKTEST V6 FINALIZADO")
 print("       NO SE ENVIARON ORDENES")
 print("==============================================")
