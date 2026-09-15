@@ -1082,3 +1082,133 @@ print("SIN PAPER ORDERS")
 print("SIN LIVE ORDERS")
 print()
 print("==============================================")
+# ============================================================
+# GUARDAR RESULTADOS EN ARCHIVO
+# ============================================================
+
+with open("backtest_results.txt", "w", encoding="utf-8") as file:
+
+    file.write("AI TRADER — MULTI BACKTEST V2\n")
+    file.write("=" * 60 + "\n\n")
+
+    file.write(
+        "ACTIVO | PERIODO | ESTRATEGIA | B&H | "
+        "TRADES | WIN% | PF | DD | CAGR | SHARPE\n"
+    )
+
+    file.write("-" * 100 + "\n")
+
+    for result in results:
+
+        pf = result["profit_factor"]
+
+        if math.isinf(pf):
+            pf_text = "INF"
+        else:
+            pf_text = f"{pf:.2f}"
+
+        file.write(
+            f"{result['symbol']:6} | "
+            f"{result['period']:7} | "
+            f"{result['return']:9.2f}% | "
+            f"{result['buy_hold']:6.2f}% | "
+            f"{result['trades']:6} | "
+            f"{result['win_rate']:5.1f}% | "
+            f"{pf_text:>4} | "
+            f"{result['drawdown']:5.2f}% | "
+            f"{result['cagr']:5.2f}% | "
+            f"{result['sharpe']:6.2f}\n"
+        )
+
+    file.write("\n")
+    file.write("=" * 60 + "\n")
+    file.write("DETALLE DE CADA PRUEBA\n")
+    file.write("=" * 60 + "\n\n")
+
+    for result in results:
+
+        file.write(
+            f"{result['symbol']} — {result['period']}\n"
+        )
+
+        file.write(
+            f"Capital final: ${result['final_capital']:,.2f}\n"
+        )
+
+        file.write(
+            f"Rendimiento: {result['return']:.2f}%\n"
+        )
+
+        file.write(
+            f"Buy & Hold: {result['buy_hold']:.2f}%\n"
+        )
+
+        file.write(
+            f"Vs Buy & Hold: {result['vs_buy_hold']:+.2f}%\n"
+        )
+
+        file.write(
+            f"Trades: {result['trades']}\n"
+        )
+
+        file.write(
+            f"Win rate: {result['win_rate']:.2f}%\n"
+        )
+
+        file.write(
+            f"Profit Factor: {result['profit_factor']:.2f}\n"
+            if not math.isinf(result["profit_factor"])
+            else "Profit Factor: INF\n"
+        )
+
+        file.write(
+            f"Drawdown máximo: {result['drawdown']:.2f}% "
+            f"(${result['drawdown_dollars']:,.2f})\n"
+        )
+
+        file.write(
+            f"CAGR: {result['cagr']:.2f}%\n"
+        )
+
+        file.write(
+            f"Sharpe: {result['sharpe']:.2f}\n"
+        )
+
+        file.write(
+            f"Racha máxima de pérdidas: "
+            f"{result['max_losing_streak']}\n"
+        )
+
+        file.write(
+            f"Mejor operación: "
+            f"${result['best_trade']:,.2f}\n"
+        )
+
+        file.write(
+            f"Peor operación: "
+            f"${result['worst_trade']:,.2f}\n"
+        )
+
+        file.write(
+            f"Costos simulados: "
+            f"${result['commissions']:,.2f}\n"
+        )
+
+        file.write(
+            f"Periodo: "
+            f"{result['start_date']} → {result['end_date']}\n"
+        )
+
+        file.write("\n" + "-" * 60 + "\n\n")
+
+    file.write("BACKTEST V2 SOLAMENTE\n")
+    file.write("NO SE ENVIARON ÓRDENES\n")
+    file.write("SIN DINERO REAL\n")
+    file.write("SIN PAPER ORDERS\n")
+    file.write("SIN LIVE ORDERS\n")
+
+
+print()
+print("==============================================")
+print("RESULTADOS GUARDADOS EN backtest_results.txt")
+print("==============================================")
