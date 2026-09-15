@@ -1,1 +1,1 @@
-web: python paper_test.py
+web: python paper_order_test.py
