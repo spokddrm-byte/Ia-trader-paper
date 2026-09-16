@@ -1,5 +1,5 @@
 """
-AI TRADER — PORTFOLIO ANALYZER V1 PANTERA
+AI TRADER — PORTFOLIO ANALYZER V2 PANTERA
 =========================================
 
 Capa de inteligencia de portafolio.
@@ -31,12 +31,24 @@ RESPONSABILIDADES:
 IMPORTANTE:
 Este módulo NO ejecuta órdenes.
 El Risk Manager sigue siendo la autoridad final de riesgo.
+
+CAMBIOS V2:
+- La concentración del candidato se mide contra equity.
+- Se evita bloquear una operación únicamente porque
+  represente un porcentaje elevado del capital actualmente
+  invertido.
+- Se mantiene el límite de exposición total.
+- Se mantiene el límite por símbolo.
+- Se mantiene el límite de posición individual.
+- Correlación y riesgo siguen siendo controles duros.
+- Compatible con la integración dinámica de main.py.
 """
 
 from __future__ import annotations
 
 import math
 import statistics
+
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -49,21 +61,26 @@ DEFAULT_MAX_TOTAL_EXPOSURE = 0.70
 DEFAULT_MAX_SYMBOL_EXPOSURE = 0.20
 DEFAULT_MAX_SINGLE_POSITION = 0.20
 
-# No bloqueamos una operación únicamente por correlación.
-# Se usa una combinación de cantidad + correlación.
+# Correlación
 DEFAULT_HIGH_CORRELATION = 0.85
 DEFAULT_EXTREME_CORRELATION = 0.92
 
-# Si el candidato representa más de este porcentaje
-# del portafolio, se considera una concentración importante.
+# Concentración
+#
+# IMPORTANTE:
+# Estos porcentajes representan peso respecto al EQUITY,
+# no respecto al capital actualmente invertido.
+#
+# Una posición del 10% del equity no debe convertirse
+# automáticamente en un bloqueo solamente porque el
+# portafolio actual tenga 30-40% de exposición.
 DEFAULT_CONCENTRATION_WARNING = 0.15
 DEFAULT_CONCENTRATION_BLOCK = 0.20
 
-# Mínimo de observaciones para una correlación razonable.
+# Mínimo de observaciones para correlación.
 DEFAULT_MIN_CORRELATION_OBSERVATIONS = 30
 
-# Máximo de posiciones fuertemente correlacionadas
-# permitidas dentro del mismo grupo.
+# Máximo de posiciones altamente correlacionadas.
 DEFAULT_MAX_HIGHLY_CORRELATED_POSITIONS = 3
 
 
@@ -211,8 +228,6 @@ def pearson_correlation(
 ) -> Optional[float]:
     """
     Correlación de Pearson sin depender de numpy/pandas.
-
-    Devuelve None si no existe información suficiente.
     """
 
     x, y = _clean_pair(x, y)
@@ -336,7 +351,15 @@ def calculate_concentration_ratio(
     projected_market_value: float,
 ) -> float:
     """
-    Peso del candidato dentro del portafolio proyectado.
+    Peso del candidato dentro del capital invertido
+    proyectado.
+
+    NOTA:
+    Esta función se conserva por compatibilidad.
+
+    Para la decisión del Analyzer V2 se utiliza
+    calculate_equity_concentration_ratio(), que mide
+    la posición contra el equity total.
     """
 
     projected_market_value = _safe_positive(
@@ -352,9 +375,39 @@ def calculate_concentration_ratio(
     )
 
 
+def calculate_equity_concentration_ratio(
+    proposed_value: float,
+    equity: float,
+) -> float:
+    """
+    Peso real del candidato respecto al equity total.
+
+    Ejemplo:
+
+        Equity = $100,000
+        Operación = $10,000
+
+        concentración = 10%
+
+    Esto evita que una cartera parcialmente invertida
+    produzca falsos bloqueos de concentración.
+    """
+
+    equity = _safe_positive(equity)
+
+    if equity <= 0:
+        return 1.0
+
+    return (
+        _safe_positive(proposed_value)
+        / equity
+    )
+
+
 def calculate_position_weights(
     positions: Sequence[PositionSnapshot],
 ) -> Dict[str, float]:
+
     total = calculate_total_market_value(
         positions
     )
@@ -395,7 +448,7 @@ def analyze_correlations(
     min_observations: int = DEFAULT_MIN_CORRELATION_OBSERVATIONS,
 ) -> Dict[str, Any]:
     """
-    Analiza correlación del candidato contra todas las
+    Analiza correlación del candidato contra las
     posiciones que tengan datos suficientes.
     """
 
@@ -570,6 +623,7 @@ def calculate_existing_portfolio_risk(
             and stop > 0
             and stop < entry
         ):
+
             distance = (
                 entry - stop
             ) / entry
@@ -585,8 +639,12 @@ def calculate_existing_portfolio_risk(
             )
 
         else:
-            # Sin stop conocido:
-            # tratamiento deliberadamente conservador.
+
+            # Sin stop conocido.
+            #
+            # El tratamiento conservador se mantiene.
+            # No se asume que una posición sin stop
+            # tiene riesgo cero.
             total_risk += value
 
     return total_risk / equity
@@ -708,6 +766,7 @@ class PortfolioAnalyzer:
         largest_weight = 0.0
 
         if weights:
+
             largest_symbol = max(
                 weights,
                 key=weights.get,
@@ -724,11 +783,13 @@ class PortfolioAnalyzer:
 
         return {
             "equity": equity,
-            "buying_power": _safe_positive(
-                buying_power
-            )
-            if buying_power is not None
-            else None,
+            "buying_power": (
+                _safe_positive(
+                    buying_power
+                )
+                if buying_power is not None
+                else None
+            ),
             "market_value": market_value,
             "total_exposure": exposure,
             "available_exposure": max(
@@ -775,6 +836,10 @@ class PortfolioAnalyzer:
 
         reasons: List[str] = []
 
+        # ----------------------------------------------------
+        # VALORES ACTUALES
+        # ----------------------------------------------------
+
         current_market_value = (
             calculate_total_market_value(
                 positions
@@ -802,11 +867,13 @@ class PortfolioAnalyzer:
         )
 
         # ----------------------------------------------------
-        # EXISTING SYMBOL
+        # EXPOSICIÓN DEL MISMO SÍMBOLO
         # ----------------------------------------------------
 
         current_symbol_value = sum(
-            _safe_positive(position.market_value)
+            _safe_positive(
+                position.market_value
+            )
             for position in positions
             if _normalize_symbol(
                 position.symbol
@@ -829,13 +896,28 @@ class PortfolioAnalyzer:
         )
 
         # ----------------------------------------------------
-        # CONCENTRATION
+        # CONCENTRACIÓN
+        # ----------------------------------------------------
+        #
+        # V1:
+        #
+        # proposed / projected_market_value
+        #
+        # Esto podía generar falsos bloqueos cuando el
+        # portafolio tenía poca exposición.
+        #
+        # V2:
+        #
+        # proposed / equity
+        #
+        # Ahora representa directamente cuánto capital
+        # del portafolio consume el candidato.
         # ----------------------------------------------------
 
         concentration_ratio = (
-            calculate_concentration_ratio(
+            calculate_equity_concentration_ratio(
                 proposed_value,
-                projected_market_value,
+                equity,
             )
         )
 
@@ -887,7 +969,7 @@ class PortfolioAnalyzer:
         )
 
         # ----------------------------------------------------
-        # CORRELATION
+        # CORRELACIÓN
         # ----------------------------------------------------
 
         average_correlation = None
@@ -934,16 +1016,21 @@ class PortfolioAnalyzer:
             )
 
             if highly_correlated:
+
                 correlation_warning = True
 
+            # Bloqueo solamente cuando el candidato
+            # ya estaría altamente correlacionado con
+            # demasiadas posiciones.
             if (
                 len(highly_correlated)
                 >= self.max_highly_correlated_positions
             ):
+
                 correlation_block = True
 
         # ----------------------------------------------------
-        # RISK
+        # RIESGO
         # ----------------------------------------------------
 
         if existing_portfolio_risk is None:
@@ -997,41 +1084,49 @@ class PortfolioAnalyzer:
         # ----------------------------------------------------
 
         if total_exposure_violation:
+
             reasons.append(
                 "TOTAL_EXPOSURE_LIMIT"
             )
 
         if symbol_exposure_violation:
+
             reasons.append(
                 "SYMBOL_EXPOSURE_LIMIT"
             )
 
         if max_position_violation:
+
             reasons.append(
                 "MAX_POSITION_LIMIT"
             )
 
         if concentration_block:
+
             reasons.append(
                 "CONCENTRATION_LIMIT"
             )
 
         if correlation_block:
+
             reasons.append(
                 "CORRELATION_CONCENTRATION"
             )
 
         if risk_violation:
+
             reasons.append(
                 "PORTFOLIO_RISK_LIMIT"
             )
 
         if correlation_warning:
+
             reasons.append(
                 "HIGH_CORRELATION_WARNING"
             )
 
         if concentration_warning:
+
             reasons.append(
                 "CONCENTRATION_WARNING"
             )
@@ -1052,6 +1147,7 @@ class PortfolioAnalyzer:
         )
 
         if approved:
+
             reasons.append(
                 "PORTFOLIO_COMPATIBLE"
             )
@@ -1063,37 +1159,50 @@ class PortfolioAnalyzer:
         score = 100.0
 
         if total_exposure_violation:
+
             score -= 35
 
         if symbol_exposure_violation:
+
             score -= 25
 
         if max_position_violation:
+
             score -= 20
 
         if concentration_block:
+
             score -= 20
 
         elif concentration_warning:
+
             score -= 8
 
         if correlation_block:
+
             score -= 20
 
         elif correlation_warning:
+
             score -= 8
 
         if risk_violation:
+
             score -= 35
 
-        # Penalización proporcional por exposición proyectada.
+        # ----------------------------------------------------
+        # PRESIÓN DE EXPOSICIÓN
+        # ----------------------------------------------------
+
         if self.max_total_exposure > 0:
+
             exposure_pressure = (
                 projected_exposure
                 / self.max_total_exposure
             )
 
             if exposure_pressure > 0.80:
+
                 score -= min(
                     15.0,
                     (
@@ -1108,16 +1217,24 @@ class PortfolioAnalyzer:
             100.0,
         )
 
+        # ----------------------------------------------------
+        # RESULTADO
+        # ----------------------------------------------------
+
         return CandidateAnalysis(
+
             symbol=symbol,
+
             proposed_value=proposed_value,
 
             current_exposure=current_exposure,
+
             projected_exposure=projected_exposure,
 
             current_symbol_exposure=(
                 current_symbol_exposure
             ),
+
             projected_symbol_exposure=(
                 projected_symbol_exposure
             ),
@@ -1129,6 +1246,7 @@ class PortfolioAnalyzer:
             available_exposure_before=(
                 available_exposure_before
             ),
+
             available_exposure_after=(
                 available_exposure_after
             ),
@@ -1136,15 +1254,19 @@ class PortfolioAnalyzer:
             max_position_violation=(
                 max_position_violation
             ),
+
             total_exposure_violation=(
                 total_exposure_violation
             ),
+
             symbol_exposure_violation=(
                 symbol_exposure_violation
             ),
+
             concentration_warning=(
                 concentration_warning
             ),
+
             concentration_block=(
                 concentration_block
             ),
@@ -1152,9 +1274,11 @@ class PortfolioAnalyzer:
             average_correlation=(
                 average_correlation
             ),
+
             maximum_correlation=(
                 maximum_correlation
             ),
+
             highly_correlated_positions=(
                 highly_correlated
             ),
@@ -1162,21 +1286,27 @@ class PortfolioAnalyzer:
             correlation_warning=(
                 correlation_warning
             ),
+
             correlation_block=(
                 correlation_block
             ),
 
             risk_increment=risk_increment,
+
             risk_remaining_before=(
                 risk_remaining_before
             ),
+
             risk_remaining_after=(
                 risk_remaining_after
             ),
+
             risk_violation=risk_violation,
 
             approved_for_portfolio=approved,
+
             reasons=reasons,
+
             score=score,
         )
 
@@ -1194,55 +1324,80 @@ class PortfolioAnalyzer:
         ] = None,
         max_portfolio_risk: float = 0.03,
     ) -> List[CandidateAnalysis]:
+
         """
         Analiza varios candidatos.
 
         No ejecuta ninguno.
 
         Los candidatos se procesan sobre el portafolio
-        ACTUAL, no sobre un portafolio ficticio creado por
-        las operaciones anteriores del mismo lote.
+        ACTUAL, no sobre un portafolio ficticio creado
+        por las operaciones anteriores del mismo lote.
         """
 
         results: List[CandidateAnalysis] = []
 
         for candidate in candidates:
 
-            symbol = candidate.get("symbol")
+            symbol = candidate.get(
+                "symbol"
+            )
 
             if not symbol:
                 continue
 
-            candidate_returns = candidate.get(
-                "returns"
+            candidate_returns = (
+                candidate.get(
+                    "returns"
+                )
             )
 
             analysis = self.analyze_candidate(
+
                 symbol=symbol,
+
                 proposed_value=_safe_float(
-                    candidate.get("proposed_value")
+                    candidate.get(
+                        "proposed_value"
+                    )
                 ),
+
                 entry_price=_safe_float(
-                    candidate.get("entry_price")
+                    candidate.get(
+                        "entry_price"
+                    )
                 ),
+
                 stop_price=candidate.get(
                     "stop_price"
                 ),
+
                 equity=equity,
+
                 positions=positions,
-                existing_returns=existing_returns,
-                candidate_returns=candidate_returns,
+
+                existing_returns=(
+                    existing_returns
+                ),
+
+                candidate_returns=(
+                    candidate_returns
+                ),
+
                 existing_portfolio_risk=(
                     candidate.get(
                         "existing_portfolio_risk"
                     )
                 ),
+
                 max_portfolio_risk=(
                     max_portfolio_risk
                 ),
             )
 
-            results.append(analysis)
+            results.append(
+                analysis
+            )
 
         # Primero compatibles.
         # Después por score.
@@ -1263,13 +1418,16 @@ class PortfolioAnalyzer:
 def build_position_snapshot(
     position: Any,
 ) -> PositionSnapshot:
+
     """
     Convierte un objeto/dict de posición en nuestro formato.
     """
 
     if isinstance(position, dict):
 
-        symbol = position.get("symbol")
+        symbol = position.get(
+            "symbol"
+        )
 
         quantity = position.get(
             "quantity",
@@ -1286,8 +1444,7 @@ def build_position_snapshot(
         )
 
         current_price = position.get(
-            "current_price",
-            position.get("current_price"),
+            "current_price"
         )
 
         unrealized_pl = position.get(
@@ -1361,33 +1518,55 @@ def build_position_snapshot(
         )
 
     return PositionSnapshot(
-        symbol=_normalize_symbol(symbol),
-        quantity=_safe_float(quantity),
+
+        symbol=_normalize_symbol(
+            symbol
+        ),
+
+        quantity=_safe_float(
+            quantity
+        ),
+
         market_value=_safe_float(
             market_value
         ),
+
         entry_price=(
-            _safe_float(entry_price)
+            _safe_float(
+                entry_price
+            )
             if entry_price is not None
             else None
         ),
+
         current_price=(
-            _safe_float(current_price)
+            _safe_float(
+                current_price
+            )
             if current_price is not None
             else None
         ),
+
         unrealized_pl=(
-            _safe_float(unrealized_pl)
+            _safe_float(
+                unrealized_pl
+            )
             if unrealized_pl is not None
             else None
         ),
+
         original_stop=(
-            _safe_float(original_stop)
+            _safe_float(
+                original_stop
+            )
             if original_stop is not None
             else None
         ),
+
         current_stop=(
-            _safe_float(current_stop)
+            _safe_float(
+                current_stop
+            )
             if current_stop is not None
             else None
         ),
@@ -1409,31 +1588,45 @@ def analyze_portfolio_candidate(
     ] = None,
     max_portfolio_risk: float = 0.03,
 ) -> Dict[str, Any]:
+
     """
     Función sencilla para integrar posteriormente
     con main.py.
     """
 
     snapshots = [
-        build_position_snapshot(position)
+        build_position_snapshot(
+            position
+        )
         for position in positions
     ]
 
     analyzer = PortfolioAnalyzer()
 
     result = analyzer.analyze_candidate(
+
         symbol=symbol,
+
         proposed_value=proposed_value,
+
         entry_price=entry_price,
+
         stop_price=stop_price,
+
         equity=equity,
+
         positions=snapshots,
+
         existing_returns=existing_returns,
+
         candidate_returns=candidate_returns,
+
         max_portfolio_risk=max_portfolio_risk,
     )
 
-    return asdict(result)
+    return asdict(
+        result
+    )
 
 
 # ============================================================
@@ -1446,6 +1639,7 @@ def self_test() -> None:
     """
 
     positions = [
+
         PositionSnapshot(
             symbol="AAPL",
             quantity=10,
@@ -1454,6 +1648,7 @@ def self_test() -> None:
             current_price=200,
             current_stop=180,
         ),
+
         PositionSnapshot(
             symbol="MSFT",
             quantity=5,
@@ -1462,6 +1657,7 @@ def self_test() -> None:
             current_price=400,
             current_stop=370,
         ),
+
     ]
 
     equity = 10000
@@ -1469,28 +1665,60 @@ def self_test() -> None:
     analyzer = PortfolioAnalyzer()
 
     snapshot = analyzer.portfolio_snapshot(
+
         positions=positions,
+
         equity=equity,
+
         buying_power=5000,
     )
 
-    assert snapshot["market_value"] == 4000
+    assert snapshot[
+        "market_value"
+    ] == 4000
+
     assert abs(
-        snapshot["total_exposure"] - 0.40
+        snapshot[
+            "total_exposure"
+        ] - 0.40
     ) < 0.000001
 
     result = analyzer.analyze_candidate(
+
         symbol="NVDA",
+
         proposed_value=1000,
+
         entry_price=100,
+
         stop_price=95,
+
         equity=equity,
+
         positions=positions,
     )
 
     assert result.symbol == "NVDA"
+
     assert result.proposed_value == 1000
-    assert result.projected_exposure == 0.50
+
+    assert (
+        result.projected_exposure
+        == 0.50
+    )
+
+    # V2:
+    # $1,000 sobre $10,000 = 10%.
+    # No debe ser bloqueado por concentración.
+    assert abs(
+        result.concentration_ratio
+        - 0.10
+    ) < 0.000001
+
+    assert (
+        result.concentration_block
+        is False
+    )
 
     print(
         "PORTFOLIO ANALYZER SELF-TEST: OK"
@@ -1502,11 +1730,21 @@ def self_test() -> None:
 # ============================================================
 
 if __name__ == "__main__":
-    print("=" * 72)
-    print("AI TRADER — PORTFOLIO ANALYZER V1 PANTERA")
-    print("=" * 72)
+
+    print(
+        "=" * 72
+    )
+
+    print(
+        "AI TRADER — PORTFOLIO ANALYZER V2 PANTERA"
+    )
+
+    print(
+        "=" * 72
+    )
 
     try:
+
         self_test()
 
         print(
