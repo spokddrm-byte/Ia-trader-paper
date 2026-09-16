@@ -81,20 +81,26 @@ from ai_engine import (
 
 API_KEY = os.getenv("APCA_API_KEY_ID")
 API_SECRET = os.getenv("APCA_API_SECRET_KEY")
+
 PAPER_TRADING = True
 
 SYMBOLS = [
-    "AAPL","MSFT","NVDA","AMZN","GOOGL","META","TSLA","AVGO","AMD","NFLX",
-    "JPM","V","MA","COST","WMT","HD","ORCL","CRM","ADBE","INTC","QCOM",
-    "MU","AMAT","SPY","QQQ"
+    "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL",
+    "META", "TSLA", "AVGO", "AMD", "NFLX",
+    "JPM", "V", "MA", "COST", "WMT",
+    "HD", "ORCL", "CRM", "ADBE", "INTC",
+    "QCOM", "MU", "AMAT", "SPY", "QQQ"
 ]
 
 BENCHMARK = "SPY"
+
 LOOKBACK_DAYS = 180
 MIN_BARS = 60
+
 DATA_FEED = DataFeed.IEX
 
 MAX_NEW_POSITIONS_PER_CYCLE = 2
+
 MIN_SCORE_TO_TRADE = 70
 MIN_PRICE = 5.0
 MIN_AVG_VOLUME = 500_000
@@ -107,14 +113,27 @@ RELATIVE_STRENGTH_PERIOD = 20
 VOLUME_PERIOD = 20
 
 ATR_STOP_MULTIPLIER = 2.0
+
 MIN_STOP_PERCENT = 0.005
 MAX_STOP_PERCENT = 0.10
 
 MIN_RSI = 45
 MAX_RSI = 68
+
 REQUEST_DELAY = 0.15
 
+# ------------------------------------------------------------
+# MARKET DATA
+# ------------------------------------------------------------
+
 DATA_LOOKBACK_CALENDAR_DAYS = LOOKBACK_DAYS + 40
+
+# Ventanas adicionales para benchmark.
+BENCHMARK_LOOKBACK_WINDOWS = [
+    DATA_LOOKBACK_CALENDAR_DAYS,
+    365,
+    550
+]
 
 # ============================================================
 # OUTPUT
@@ -128,13 +147,18 @@ CYAN = "\033[96m"
 MAGENTA = "\033[95m"
 WHITE = "\033[97m"
 
+
 # ============================================================
 # UTILIDADES
 # ============================================================
 
 def safe_float(value, default=0.0):
     try:
+        if value is None:
+            return default
+
         return float(value)
+
     except (TypeError, ValueError):
         return default
 
@@ -142,6 +166,7 @@ def safe_float(value, default=0.0):
 def safe_int(value, default=0):
     try:
         return int(float(value))
+
     except (TypeError, ValueError):
         return default
 
@@ -155,6 +180,7 @@ def now_utc():
 
 
 def print_header():
+
     print()
     print("=" * 72)
     print("        AI TRADER — V4 PANTERA + AI ENGINE V1")
@@ -167,6 +193,7 @@ def print_header():
 # ============================================================
 
 def create_clients():
+
     if not API_KEY or not API_SECRET:
         raise RuntimeError(
             "FALTAN APCA_API_KEY_ID O APCA_API_SECRET_KEY"
@@ -191,6 +218,7 @@ def create_clients():
 # ============================================================
 
 def get_account_snapshot(trading_client):
+
     account = trading_client.get_account()
 
     return {
@@ -206,7 +234,9 @@ def get_account_snapshot(trading_client):
 # ============================================================
 
 def check_market(trading_client):
+
     clock = trading_client.get_clock()
+
     return bool(clock.is_open), clock
 
 
@@ -215,19 +245,28 @@ def check_market(trading_client):
 # ============================================================
 
 def get_positions(trading_client):
+
     positions = trading_client.get_all_positions()
+
     result = {}
 
     for position in positions:
+
         symbol = str(position.symbol).upper()
 
         result[symbol] = {
             "symbol": symbol,
             "qty": safe_float(position.qty),
             "market_value": safe_float(position.market_value),
-            "avg_entry_price": safe_float(position.avg_entry_price),
-            "current_price": safe_float(position.current_price),
-            "unrealized_pl": safe_float(position.unrealized_pl)
+            "avg_entry_price": safe_float(
+                position.avg_entry_price
+            ),
+            "current_price": safe_float(
+                position.current_price
+            ),
+            "unrealized_pl": safe_float(
+                position.unrealized_pl
+            )
         }
 
     return result
@@ -238,64 +277,400 @@ def get_positions(trading_client):
 # ============================================================
 
 def get_open_orders(trading_client):
+
     request = GetOrdersRequest(
         status=QueryOrderStatus.OPEN,
         limit=500,
         nested=True
     )
 
-    orders = trading_client.get_orders(filter=request)
+    orders = trading_client.get_orders(
+        filter=request
+    )
+
     result = {}
 
     for order in orders:
-        symbol = str(order.symbol).upper()
+
+        symbol = getattr(order, "symbol", None)
+
+        if not symbol:
+            continue
+
+        symbol = str(symbol).upper()
+
         result.setdefault(symbol, [])
+
         result[symbol].append(order)
 
     return result
 
 
 # ============================================================
+# EXTRACCIÓN ROBUSTA DE STOP
+# ============================================================
+
+def extract_stop_from_order(order):
+
+    """
+    Intenta localizar el stop de una orden Alpaca.
+
+    Soporta:
+    - orden stop_loss directa
+    - órdenes OTO/OCO
+    - legs
+    - nested orders
+    """
+
+    if order is None:
+        return 0.0
+
+    # --------------------------------------------------------
+    # stop_price directo
+    # --------------------------------------------------------
+
+    direct_stop = safe_float(
+        getattr(order, "stop_price", 0)
+    )
+
+    if direct_stop > 0:
+        return direct_stop
+
+    # --------------------------------------------------------
+    # order_class / legs
+    # --------------------------------------------------------
+
+    legs = getattr(order, "legs", None)
+
+    if legs:
+
+        try:
+            for leg in legs:
+
+                stop = extract_stop_from_order(leg)
+
+                if stop > 0:
+                    return stop
+
+        except Exception:
+            pass
+
+    # --------------------------------------------------------
+    # nested_orders
+    # --------------------------------------------------------
+
+    nested = getattr(
+        order,
+        "nested_orders",
+        None
+    )
+
+    if nested:
+
+        try:
+            for child in nested:
+
+                stop = extract_stop_from_order(child)
+
+                if stop > 0:
+                    return stop
+
+        except Exception:
+            pass
+
+    # --------------------------------------------------------
+    # stop_loss como objeto
+    # --------------------------------------------------------
+
+    stop_loss = getattr(
+        order,
+        "stop_loss",
+        None
+    )
+
+    if stop_loss is not None:
+
+        stop = safe_float(
+            getattr(
+                stop_loss,
+                "stop_price",
+                0
+            )
+        )
+
+        if stop > 0:
+            return stop
+
+    return 0.0
+
+
+def get_broker_stop_for_symbol(
+    symbol,
+    open_orders
+):
+
+    symbol = str(symbol).upper()
+
+    orders = open_orders.get(
+        symbol,
+        []
+    )
+
+    for order in orders:
+
+        stop = extract_stop_from_order(order)
+
+        if stop > 0:
+            return stop
+
+    return 0.0
+
+
+# ============================================================
 # BLOQUEO
 # ============================================================
 
-def symbol_is_locked(symbol, positions, open_orders):
-    return symbol in positions or symbol in open_orders
+def symbol_is_locked(
+    symbol,
+    positions,
+    open_orders
+):
+
+    return (
+        symbol in positions
+        or symbol in open_orders
+    )
 
 
 # ============================================================
-# BARRAS — CORREGIDO
+# BARRAS
 # ============================================================
 
-def get_daily_bars(data_client, symbol):
-    """
-    Descarga barras diarias de Alpaca de forma robusta.
-
-    Correcciones:
-    - symbol_or_symbols recibe una LISTA.
-    - start/end explícitos y timezone-aware.
-    - rango inicial de días calendario.
-    - reintento con 365 días si hay pocos datos.
-    - limit alto.
-    - extracción compatible con BarSet.
-    - orden cronológico.
-    - eliminación de duplicados.
-    - conserva como máximo LOOKBACK_DAYS.
-    """
+def extract_bars_from_response(
+    response,
+    symbol
+):
 
     symbol = str(symbol).upper()
+
+    bars = []
+
+    # --------------------------------------------------------
+    # Método 1 — response.data
+    # --------------------------------------------------------
+
+    try:
+
+        data = getattr(
+            response,
+            "data",
+            None
+        )
+
+        if isinstance(data, dict):
+
+            direct = data.get(symbol)
+
+            if direct:
+                bars = list(direct)
+
+            if not bars:
+
+                for key, value in data.items():
+
+                    if str(key).upper() == symbol:
+
+                        bars = list(value)
+
+                        break
+
+    except Exception:
+        bars = []
+
+    if bars:
+        return bars
+
+    # --------------------------------------------------------
+    # Método 2 — response[symbol]
+    # --------------------------------------------------------
+
+    try:
+
+        bars = list(
+            response[symbol]
+        )
+
+    except Exception:
+        bars = []
+
+    if bars:
+        return bars
+
+    # --------------------------------------------------------
+    # Método 3 — response.df
+    # --------------------------------------------------------
+
+    try:
+
+        dataframe = getattr(
+            response,
+            "df",
+            None
+        )
+
+        if dataframe is not None:
+
+            if len(dataframe) > 0:
+
+                # MultiIndex:
+                # symbol / timestamp
+                try:
+
+                    if hasattr(
+                        dataframe.index,
+                        "levels"
+                    ):
+
+                        symbols = [
+                            str(x).upper()
+                            for x in dataframe.index
+                            .get_level_values(0)
+                        ]
+
+                        if symbol in symbols:
+
+                            subset = dataframe[
+                                dataframe.index
+                                .get_level_values(0)
+                                .astype(str)
+                                .str.upper()
+                                == symbol
+                            ]
+
+                            for timestamp, row in subset.iterrows():
+
+                                if hasattr(
+                                    timestamp,
+                                    "__len__"
+                                ) and not isinstance(
+                                    timestamp,
+                                    str
+                                ):
+                                    ts = timestamp[-1]
+                                else:
+                                    ts = timestamp
+
+                                bars.append(
+                                    type(
+                                        "BarObject",
+                                        (),
+                                        {
+                                            "timestamp": ts,
+                                            "open": row.get(
+                                                "open",
+                                                0
+                                            ),
+                                            "high": row.get(
+                                                "high",
+                                                0
+                                            ),
+                                            "low": row.get(
+                                                "low",
+                                                0
+                                            ),
+                                            "close": row.get(
+                                                "close",
+                                                0
+                                            ),
+                                            "volume": row.get(
+                                                "volume",
+                                                0
+                                            )
+                                        }
+                                    )()
+                                )
+
+                except Exception:
+                    pass
+
+                # Index simple
+                if not bars:
+
+                    for timestamp, row in dataframe.iterrows():
+
+                        bars.append(
+                            type(
+                                "BarObject",
+                                (),
+                                {
+                                    "timestamp": timestamp,
+                                    "open": row.get(
+                                        "open",
+                                        0
+                                    ),
+                                    "high": row.get(
+                                        "high",
+                                        0
+                                    ),
+                                    "low": row.get(
+                                        "low",
+                                        0
+                                    ),
+                                    "close": row.get(
+                                        "close",
+                                        0
+                                    ),
+                                    "volume": row.get(
+                                        "volume",
+                                        0
+                                    )
+                                }
+                            )()
+                        )
+
+    except Exception:
+        pass
+
+    return bars
+
+
+# ============================================================
+# BARRAS — ROBUSTO
+# ============================================================
+
+def get_daily_bars(
+    data_client,
+    symbol,
+    benchmark=False
+):
+
+    symbol = str(symbol).upper()
+
     end_time = now_utc()
 
-    lookback_windows = [
-        DATA_LOOKBACK_CALENDAR_DAYS,
-        365
-    ]
+    if benchmark:
+
+        lookback_windows = (
+            BENCHMARK_LOOKBACK_WINDOWS
+        )
+
+    else:
+
+        lookback_windows = [
+            DATA_LOOKBACK_CALENDAR_DAYS,
+            365
+        ]
+
+    last_start_time = None
 
     for calendar_days in lookback_windows:
 
         start_time = (
-            end_time - timedelta(days=calendar_days)
+            end_time
+            - timedelta(days=calendar_days)
         )
+
+        last_start_time = start_time
 
         request_kwargs = {
             "symbol_or_symbols": [symbol],
@@ -306,90 +681,96 @@ def get_daily_bars(data_client, symbol):
             "feed": DATA_FEED
         }
 
-        request = StockBarsRequest(**request_kwargs)
-
         try:
-            response = data_client.get_stock_bars(request)
+
+            request = StockBarsRequest(
+                **request_kwargs
+            )
+
+            response = data_client.get_stock_bars(
+                request
+            )
+
         except Exception as error:
+
             print(
                 RED
                 + f"[MARKET DATA] {symbol}: "
                   f"error solicitando barras: {error}"
                 + RESET
             )
+
             continue
 
-        bars = []
-
-        # BarSet normalmente expone .data como diccionario.
-        try:
-            data = getattr(response, "data", None)
-
-            if isinstance(data, dict):
-                bars = list(data.get(symbol, []))
-
-        except Exception:
-            bars = []
-
-        # Fallback por si la versión instalada permite response[symbol].
-        if not bars:
-            try:
-                bars = list(response[symbol])
-            except Exception:
-                bars = []
-
-        # Fallback adicional por si la clave viene en otra capitalización.
-        if not bars:
-            try:
-                data = getattr(response, "data", None)
-
-                if isinstance(data, dict):
-                    for key, value in data.items():
-                        if str(key).upper() == symbol:
-                            bars = list(value)
-                            break
-            except Exception:
-                pass
+        bars = extract_bars_from_response(
+            response,
+            symbol
+        )
 
         if not bars:
+
             print(
                 YELLOW
                 + f"[MARKET DATA] {symbol}: "
-                  f"0 barras con rango de {calendar_days} días."
+                  f"0 barras con rango de "
+                  f"{calendar_days} días."
                 + RESET
             )
+
             continue
 
-        # Orden cronológico.
+        # ----------------------------------------------------
+        # ORDEN
+        # ----------------------------------------------------
+
         try:
+
             bars.sort(
                 key=lambda bar: getattr(
                     bar,
                     "timestamp",
-                    datetime.min.replace(tzinfo=timezone.utc)
+                    datetime.min.replace(
+                        tzinfo=timezone.utc
+                    )
                 )
             )
+
         except Exception:
             pass
 
-        # Eliminar duplicados por timestamp.
+        # ----------------------------------------------------
+        # DUPLICADOS
+        # ----------------------------------------------------
+
         unique_bars = []
+
         seen = set()
 
         for bar in bars:
-            timestamp = getattr(bar, "timestamp", None)
+
+            timestamp = getattr(
+                bar,
+                "timestamp",
+                None
+            )
 
             if timestamp is not None:
+
                 if timestamp in seen:
                     continue
+
                 seen.add(timestamp)
 
             unique_bars.append(bar)
 
         bars = unique_bars
 
-        # Mantener sólo el lookback solicitado.
+        # ----------------------------------------------------
+        # LOOKBACK
+        # ----------------------------------------------------
+
         if len(bars) > LOOKBACK_DAYS:
+
             bars = bars[-LOOKBACK_DAYS:]
 
         print(
@@ -400,36 +781,54 @@ def get_daily_bars(data_client, symbol):
             + RESET
         )
 
-        if len(bars) < MIN_BARS:
+        # ----------------------------------------------------
+        # SUFICIENTES
+        # ----------------------------------------------------
+
+        if len(bars) >= MIN_BARS:
+
+            return bars
+
+        # ----------------------------------------------------
+        # BENCHMARK
+        # ----------------------------------------------------
+
+        if benchmark:
+
             print(
                 YELLOW
                 + f"[MARKET DATA] {symbol}: "
-                  f"{len(bars)}/{MIN_BARS} barras mínimas."
+                  f"{len(bars)}/{MIN_BARS} "
+                  f"barras mínimas."
                 + RESET
             )
 
-            # Si ya usamos el rango de 365 días, devolvemos
-            # lo que exista para que el llamador decida.
-            if calendar_days == lookback_windows[-1]:
-                return bars
-
             continue
 
-        return bars
+        # ----------------------------------------------------
+        # ACTIVO NORMAL
+        # ----------------------------------------------------
+
+        if calendar_days == lookback_windows[-1]:
+
+            return bars
 
     print(
         RED
         + f"[MARKET DATA] {symbol}: "
-          "ALPACA NO DEVOLVIÓ BARRAS."
+          "ALPACA NO DEVOLVIÓ DATOS SUFICIENTES."
         + RESET
     )
 
-    print(
-        YELLOW
-        + f"[MARKET DATA] Último rango probado: "
-          f"{start_time.isoformat()} → {end_time.isoformat()}"
-        + RESET
-    )
+    if last_start_time is not None:
+
+        print(
+            YELLOW
+            + f"[MARKET DATA] Último rango: "
+              f"{last_start_time.isoformat()} "
+              f"→ {end_time.isoformat()}"
+            + RESET
+        )
 
     print(
         YELLOW
@@ -445,19 +844,28 @@ def get_daily_bars(data_client, symbol):
 # ============================================================
 
 def calculate_returns(bars):
+
     if len(bars) < 2:
         return []
 
     returns = []
 
     for index in range(1, len(bars)):
-        previous = safe_float(bars[index - 1].close)
-        current = safe_float(bars[index].close)
+
+        previous = safe_float(
+            bars[index - 1].close
+        )
+
+        current = safe_float(
+            bars[index].close
+        )
 
         if previous <= 0 or current <= 0:
             continue
 
-        returns.append((current / previous) - 1.0)
+        returns.append(
+            (current / previous) - 1.0
+        )
 
     return returns
 
@@ -466,39 +874,70 @@ def calculate_returns(bars):
 # ATR
 # ============================================================
 
-def calculate_atr(bars, period=14):
+def calculate_atr(
+    bars,
+    period=14
+):
+
     if len(bars) < period + 1:
         return None
 
     true_ranges = []
 
     for i in range(1, len(bars)):
+
         current = bars[i]
         previous = bars[i - 1]
 
-        high = safe_float(current.high)
-        low = safe_float(current.low)
-        previous_close = safe_float(previous.close)
+        high = safe_float(
+            current.high
+        )
+
+        low = safe_float(
+            current.low
+        )
+
+        previous_close = safe_float(
+            previous.close
+        )
 
         if high <= 0 or low <= 0:
             continue
 
         true_range = max(
             high - low,
-            abs(high - previous_close),
-            abs(low - previous_close)
+            abs(
+                high
+                - previous_close
+            ),
+            abs(
+                low
+                - previous_close
+            )
         )
 
-        true_ranges.append(true_range)
+        true_ranges.append(
+            true_range
+        )
 
     if len(true_ranges) < period:
         return None
 
-    return sum(true_ranges[-period:]) / period
+    return (
+        sum(true_ranges[-period:])
+        / period
+    )
 
 
-def calculate_atr_percent(price, atr_value):
-    if price <= 0 or atr_value is None:
+def calculate_atr_percent(
+    price,
+    atr_value
+):
+
+    if (
+        price <= 0
+        or atr_value is None
+    ):
         return 0.0
 
     return atr_value / price
@@ -508,7 +947,11 @@ def calculate_atr_percent(price, atr_value):
 # VOLUMEN
 # ============================================================
 
-def calculate_average_volume(bars, period=20):
+def calculate_average_volume(
+    bars,
+    period=20
+):
+
     if len(bars) < period:
         return None
 
@@ -520,7 +963,10 @@ def calculate_average_volume(bars, period=20):
     if not volumes:
         return None
 
-    return sum(volumes) / len(volumes)
+    return (
+        sum(volumes)
+        / len(volumes)
+    )
 
 
 # ============================================================
@@ -532,6 +978,10 @@ def calculate_relative_strength(
     benchmark_bars,
     period=20
 ):
+
+    if not benchmark_bars:
+        return None
+
     if (
         len(symbol_bars) < period + 1
         or len(benchmark_bars) < period + 1
@@ -541,6 +991,7 @@ def calculate_relative_strength(
     symbol_start = safe_float(
         symbol_bars[-period - 1].close
     )
+
     symbol_end = safe_float(
         symbol_bars[-1].close
     )
@@ -548,30 +999,53 @@ def calculate_relative_strength(
     benchmark_start = safe_float(
         benchmark_bars[-period - 1].close
     )
+
     benchmark_end = safe_float(
         benchmark_bars[-1].close
     )
 
-    if symbol_start <= 0 or benchmark_start <= 0:
+    if (
+        symbol_start <= 0
+        or benchmark_start <= 0
+    ):
         return None
 
-    symbol_return = (symbol_end / symbol_start) - 1
-    benchmark_return = (benchmark_end / benchmark_start) - 1
+    symbol_return = (
+        symbol_end / symbol_start
+    ) - 1
 
-    return symbol_return - benchmark_return
+    benchmark_return = (
+        benchmark_end / benchmark_start
+    ) - 1
+
+    return (
+        symbol_return
+        - benchmark_return
+    )
 
 
 # ============================================================
 # SCORES
 # ============================================================
 
-def score_trend(price, sma_value, ema_value):
+def score_trend(
+    price,
+    sma_value,
+    ema_value
+):
+
     score = 0
 
-    if sma_value is not None and price > sma_value:
+    if (
+        sma_value is not None
+        and price > sma_value
+    ):
         score += 10
 
-    if ema_value is not None and price > ema_value:
+    if (
+        ema_value is not None
+        and price > ema_value
+    ):
         score += 10
 
     if (
@@ -585,6 +1059,7 @@ def score_trend(price, sma_value, ema_value):
 
 
 def score_rsi(rsi_value):
+
     if rsi_value is None:
         return 0
 
@@ -604,16 +1079,24 @@ def score_rsi(rsi_value):
 
 
 def score_momentum(bars):
+
     if len(bars) < 21:
         return 0
 
-    current = safe_float(bars[-1].close)
-    previous = safe_float(bars[-21].close)
+    current = safe_float(
+        bars[-1].close
+    )
+
+    previous = safe_float(
+        bars[-21].close
+    )
 
     if previous <= 0:
         return 0
 
-    return_pct = (current / previous) - 1
+    return_pct = (
+        current / previous
+    ) - 1
 
     if return_pct >= 0.10:
         return 15
@@ -631,6 +1114,7 @@ def score_momentum(bars):
 
 
 def score_volume(bars):
+
     if len(bars) < VOLUME_PERIOD + 1:
         return 0
 
@@ -639,12 +1123,20 @@ def score_volume(bars):
         VOLUME_PERIOD
     )
 
-    current_volume = safe_float(bars[-1].volume)
+    current_volume = safe_float(
+        bars[-1].volume
+    )
 
-    if average_volume is None or average_volume <= 0:
+    if (
+        average_volume is None
+        or average_volume <= 0
+    ):
         return 0
 
-    ratio = current_volume / average_volume
+    ratio = (
+        current_volume
+        / average_volume
+    )
 
     if ratio >= 1.50:
         return 10
@@ -658,7 +1150,10 @@ def score_volume(bars):
     return 0
 
 
-def score_relative_strength(relative_strength):
+def score_relative_strength(
+    relative_strength
+):
+
     if relative_strength is None:
         return 0
 
@@ -677,7 +1172,10 @@ def score_relative_strength(relative_strength):
     return 0
 
 
-def score_volatility(atr_percent):
+def score_volatility(
+    atr_percent
+):
+
     if atr_percent <= 0:
         return 0
 
@@ -697,7 +1195,12 @@ def score_volatility(atr_percent):
 # ANALIZAR ACTIVO
 # ============================================================
 
-def analyze_symbol(symbol, bars, benchmark_bars):
+def analyze_symbol(
+    symbol,
+    bars,
+    benchmark_bars
+):
+
     if len(bars) < MIN_BARS:
         return None
 
@@ -714,22 +1217,41 @@ def analyze_symbol(symbol, bars, benchmark_bars):
     if price < MIN_PRICE:
         return None
 
-    sma_value = sma(closes, SMA_FAST)
-    ema_value = ema(closes, EMA_FAST)
-    rsi_value = rsi(closes, RSI_PERIOD)
-    atr_value = calculate_atr(bars, ATR_PERIOD)
+    sma_value = sma(
+        closes,
+        SMA_FAST
+    )
+
+    ema_value = ema(
+        closes,
+        EMA_FAST
+    )
+
+    rsi_value = rsi(
+        closes,
+        RSI_PERIOD
+    )
+
+    atr_value = calculate_atr(
+        bars,
+        ATR_PERIOD
+    )
 
     average_volume = calculate_average_volume(
         bars,
         VOLUME_PERIOD
     )
 
-    current_volume = safe_float(bars[-1].volume)
+    current_volume = safe_float(
+        bars[-1].volume
+    )
 
-    relative_strength = calculate_relative_strength(
-        bars,
-        benchmark_bars,
-        RELATIVE_STRENGTH_PERIOD
+    relative_strength = (
+        calculate_relative_strength(
+            bars,
+            benchmark_bars,
+            RELATIVE_STRENGTH_PERIOD
+        )
     )
 
     atr_percent = calculate_atr_percent(
@@ -751,11 +1273,25 @@ def analyze_symbol(symbol, bars, benchmark_bars):
         ema_value
     )
 
-    rsi_score = score_rsi(rsi_value)
-    momentum_score = score_momentum(bars)
-    volume_score = score_volume(bars)
-    relative_score = score_relative_strength(relative_strength)
-    volatility_score = score_volatility(atr_percent)
+    rsi_score = score_rsi(
+        rsi_value
+    )
+
+    momentum_score = score_momentum(
+        bars
+    )
+
+    volume_score = score_volume(
+        bars
+    )
+
+    relative_score = score_relative_strength(
+        relative_strength
+    )
+
+    volatility_score = score_volatility(
+        atr_percent
+    )
 
     total_score = (
         trend_score
@@ -777,6 +1313,22 @@ def analyze_symbol(symbol, bars, benchmark_bars):
         <= MAX_RSI
     )
 
+    # --------------------------------------------------------
+    # IMPORTANTE:
+    #
+    # Si SPY no está disponible:
+    # relative_strength = None
+    #
+    # NO inventamos RS.
+    #
+    # El filtro de RS se desactiva solamente porque
+    # el benchmark no está disponible.
+    # --------------------------------------------------------
+
+    benchmark_available = (
+        relative_strength is not None
+    )
+
     positive_relative_strength = (
         relative_strength is not None
         and relative_strength > 0
@@ -787,19 +1339,35 @@ def analyze_symbol(symbol, bars, benchmark_bars):
         and average_volume >= MIN_AVG_VOLUME
     )
 
+    if benchmark_available:
+
+        relative_strength_filter = (
+            positive_relative_strength
+        )
+
+    else:
+
+        relative_strength_filter = True
+
     buy_signal = (
         bullish_trend
         and valid_rsi
-        and positive_relative_strength
+        and relative_strength_filter
         and enough_volume
         and total_score >= MIN_SCORE_TO_TRADE
     )
 
-    raw_stop = price - (
-        atr_value * ATR_STOP_MULTIPLIER
+    raw_stop = (
+        price
+        - (
+            atr_value
+            * ATR_STOP_MULTIPLIER
+        )
     )
 
-    stop_distance = (price - raw_stop) / price
+    stop_distance = (
+        price - raw_stop
+    ) / price
 
     stop_distance = clamp(
         stop_distance,
@@ -807,27 +1375,49 @@ def analyze_symbol(symbol, bars, benchmark_bars):
         MAX_STOP_PERCENT
     )
 
-    stop_price = price * (1 - stop_distance)
+    stop_price = (
+        price
+        * (
+            1
+            - stop_distance
+        )
+    )
 
     volume_ratio = 0.0
 
-    if average_volume is not None and average_volume > 0:
-        volume_ratio = current_volume / average_volume
+    if (
+        average_volume is not None
+        and average_volume > 0
+    ):
+
+        volume_ratio = (
+            current_volume
+            / average_volume
+        )
 
     price_vs_ema_pct = 0.0
 
     if ema_value > 0:
-        price_vs_ema_pct = (price / ema_value) - 1.0
+
+        price_vs_ema_pct = (
+            price / ema_value
+        ) - 1.0
 
     price_vs_sma_pct = 0.0
 
     if sma_value > 0:
-        price_vs_sma_pct = (price / sma_value) - 1.0
+
+        price_vs_sma_pct = (
+            price / sma_value
+        ) - 1.0
 
     trend_strength = 0.0
 
     if sma_value > 0:
-        trend_strength = (ema_value / sma_value) - 1.0
+
+        trend_strength = (
+            ema_value / sma_value
+        ) - 1.0
 
     return {
         "symbol": symbol,
@@ -840,26 +1430,36 @@ def analyze_symbol(symbol, bars, benchmark_bars):
         "average_volume": average_volume,
         "current_volume": current_volume,
         "volume_ratio": volume_ratio,
+
         "relative_strength": (
             relative_strength
             if relative_strength is not None
             else 0.0
         ),
+
+        "benchmark_available": benchmark_available,
+
         "price_vs_ema_pct": price_vs_ema_pct,
         "price_vs_sma_pct": price_vs_sma_pct,
         "trend_strength": trend_strength,
+
         "trend_score": trend_score,
         "rsi_score": rsi_score,
         "momentum_score": momentum_score,
         "volume_score": volume_score,
         "relative_score": relative_score,
         "volatility_score": volatility_score,
+
         "score": total_score,
+
         "bullish_trend": bullish_trend,
         "valid_rsi": valid_rsi,
-        "positive_relative_strength": positive_relative_strength,
+        "positive_relative_strength":
+            positive_relative_strength,
         "enough_volume": enough_volume,
+
         "buy_signal": buy_signal,
+
         "stop_price": stop_price,
         "stop_distance": stop_distance
     }
@@ -869,42 +1469,84 @@ def analyze_symbol(symbol, bars, benchmark_bars):
 # AI ENGINE
 # ============================================================
 
-def record_signal_for_ai(analysis):
+def record_signal_for_ai(
+    analysis
+):
+
     try:
+
         experience_id = record_ai_signal(
             symbol=analysis["symbol"],
             score=analysis["score"],
             rsi=analysis["rsi"],
             atr_pct=analysis["atr_percent"],
             volume_ratio=analysis["volume_ratio"],
-            relative_strength=analysis["relative_strength"],
-            price_vs_ema_pct=analysis["price_vs_ema_pct"],
-            price_vs_sma_pct=analysis["price_vs_sma_pct"],
-            trend_strength=analysis["trend_strength"],
+            relative_strength=analysis[
+                "relative_strength"
+            ],
+            price_vs_ema_pct=analysis[
+                "price_vs_ema_pct"
+            ],
+            price_vs_sma_pct=analysis[
+                "price_vs_sma_pct"
+            ],
+            trend_strength=analysis[
+                "trend_strength"
+            ],
+
             metadata={
-                "buy_signal": analysis["buy_signal"],
-                "trend_score": analysis["trend_score"],
-                "rsi_score": analysis["rsi_score"],
-                "momentum_score": analysis["momentum_score"],
-                "volume_score": analysis["volume_score"],
-                "relative_score": analysis["relative_score"],
-                "volatility_score": analysis["volatility_score"],
-                "stop_distance": analysis["stop_distance"],
-                "engine": "V4_PANTERA"
+                "buy_signal":
+                    analysis["buy_signal"],
+
+                "trend_score":
+                    analysis["trend_score"],
+
+                "rsi_score":
+                    analysis["rsi_score"],
+
+                "momentum_score":
+                    analysis["momentum_score"],
+
+                "volume_score":
+                    analysis["volume_score"],
+
+                "relative_score":
+                    analysis["relative_score"],
+
+                "volatility_score":
+                    analysis["volatility_score"],
+
+                "stop_distance":
+                    analysis["stop_distance"],
+
+                "benchmark_available":
+                    analysis.get(
+                        "benchmark_available",
+                        False
+                    ),
+
+                "engine":
+                    "V4_PANTERA"
             }
         )
 
         if experience_id is not None:
+
             print(
                 GREEN
-                + f"[AI MEMORY] {analysis['symbol']} "
-                  f"registrado — ID {experience_id}"
+                + f"[AI MEMORY] "
+                  f"{analysis['symbol']} "
+                  f"registrado — ID "
+                  f"{experience_id}"
                 + RESET
             )
+
         else:
+
             print(
                 YELLOW
-                + f"[AI MEMORY] {analysis['symbol']} "
+                + f"[AI MEMORY] "
+                  f"{analysis['symbol']} "
                   "no pudo registrarse"
                 + RESET
             )
@@ -912,12 +1554,15 @@ def record_signal_for_ai(analysis):
         return experience_id
 
     except Exception as error:
+
         print(
             YELLOW
             + f"[AI MEMORY] Error registrando "
-              f"{analysis['symbol']}: {error}"
+              f"{analysis['symbol']}: "
+              f"{error}"
             + RESET
         )
+
         return None
 
 
@@ -925,19 +1570,54 @@ def record_signal_for_ai(analysis):
 # OUTPUT
 # ============================================================
 
-def print_analysis(analysis):
+def print_analysis(
+    analysis
+):
+
     symbol = analysis["symbol"]
+
     score = analysis["score"]
+
     price = analysis["price"]
+
     rsi_value = analysis["rsi"]
 
-    relative = analysis["relative_strength"] * 100
-    stop_distance = analysis["stop_distance"] * 100
+    relative = (
+        analysis["relative_strength"]
+        * 100
+    )
+
+    stop_distance = (
+        analysis["stop_distance"]
+        * 100
+    )
 
     if analysis["buy_signal"]:
-        status = GREEN + "COMPRABLE" + RESET
+
+        status = (
+            GREEN
+            + "COMPRABLE"
+            + RESET
+        )
+
     else:
-        status = YELLOW + "ESPERAR" + RESET
+
+        status = (
+            YELLOW
+            + "ESPERAR"
+            + RESET
+        )
+
+    benchmark_text = ""
+
+    if not analysis.get(
+        "benchmark_available",
+        False
+    ):
+
+        benchmark_text = (
+            " | RS N/D"
+        )
 
     print(
         f"{symbol:<6} "
@@ -947,6 +1627,7 @@ def print_analysis(analysis):
         f"RS {relative:>6.2f}% | "
         f"Stop {stop_distance:>5.2f}% | "
         f"{status}"
+        f"{benchmark_text}"
     )
 
 
@@ -954,12 +1635,19 @@ def print_analysis(analysis):
 # DB
 # ============================================================
 
-def load_db_position_events(positions):
+def load_db_position_events(
+    positions
+):
+
     result = {}
 
     for symbol in positions:
+
         try:
-            event = get_open_position_event(symbol)
+
+            event = get_open_position_event(
+                symbol
+            )
 
             if event:
                 result[symbol] = event
@@ -971,92 +1659,239 @@ def load_db_position_events(positions):
 
 
 # ============================================================
+# ENRIQUECER STOPS
+# ============================================================
+
+def enrich_position_stops(
+    positions,
+    db_events,
+    open_orders
+):
+
+    """
+    Prioridad:
+
+    1. Stop registrado en DB.
+    2. Stop real encontrado en Alpaca.
+    3. Si ninguno existe -> desconocido.
+    """
+
+    enriched = {}
+
+    for symbol in positions:
+
+        event = db_events.get(
+            symbol
+        )
+
+        stop_price = 0.0
+
+        if event:
+
+            stop_price = safe_float(
+                event.get(
+                    "stop_price",
+                    event.get(
+                        "original_stop",
+                        0
+                    )
+                )
+            )
+
+        broker_stop = (
+            get_broker_stop_for_symbol(
+                symbol,
+                open_orders
+            )
+        )
+
+        if broker_stop > 0:
+
+            stop_price = broker_stop
+
+        enriched[symbol] = {
+            "stop_price": stop_price,
+            "source": (
+                "BROKER"
+                if broker_stop > 0
+                else (
+                    "DB"
+                    if stop_price > 0
+                    else "UNKNOWN"
+                )
+            )
+        }
+
+    return enriched
+
+
+# ============================================================
 # RIESGO
 # ============================================================
 
 def calculate_current_portfolio_risk_safe(
     account_value,
     positions,
-    db_events
+    db_events,
+    open_orders
 ):
+
     if not positions:
+
         return 0.0, False
 
     risk_positions = []
+
     unknown_stop = False
 
-    for symbol, position in positions.items():
-        event = db_events.get(symbol)
+    enriched_stops = enrich_position_stops(
+        positions,
+        db_events,
+        open_orders
+    )
 
-        if event is None:
-            unknown_stop = True
-            continue
+    for symbol, position in positions.items():
+
+        stop_data = enriched_stops.get(
+            symbol,
+            {}
+        )
 
         stop_price = safe_float(
-            event.get("stop_price", 0)
+            stop_data.get(
+                "stop_price",
+                0
+            )
         )
 
         if stop_price <= 0:
+
             unknown_stop = True
+
             continue
 
         risk_positions.append({
-            "position_size": position["qty"],
-            "entry_price": position["avg_entry_price"],
-            "stop_price": stop_price
+            "position_size":
+                position["qty"],
+
+            "entry_price":
+                position[
+                    "avg_entry_price"
+                ],
+
+            "stop_price":
+                stop_price
         })
 
-    if unknown_stop:
-        return MAX_PORTFOLIO_RISK, True
+    # --------------------------------------------------------
+    # SEGURIDAD
+    # --------------------------------------------------------
+    #
+    # Si falta un stop, no inventamos riesgo.
+    # Se devuelve MAX_PORTFOLIO_RISK para impedir
+    # nuevas entradas mientras exista riesgo no cuantificable.
+    #
 
-    risk = calculate_portfolio_risk(
-        account_value,
-        risk_positions
-    )
+    if unknown_stop:
+
+        return (
+            MAX_PORTFOLIO_RISK,
+            True
+        )
+
+    if not risk_positions:
+
+        return 0.0, False
+
+    try:
+
+        risk = calculate_portfolio_risk(
+            account_value,
+            risk_positions
+        )
+
+    except Exception:
+
+        return (
+            MAX_PORTFOLIO_RISK,
+            True
+        )
 
     return risk, False
 
 
-def calculate_current_exposure(account_value, positions):
+# ============================================================
+# EXPOSICIÓN
+# ============================================================
+
+def calculate_current_exposure(
+    account_value,
+    positions
+):
+
     if account_value <= 0:
+
         return 1.0
 
     total_market_value = 0.0
 
     for position in positions.values():
+
         total_market_value += abs(
-            safe_float(position["market_value"])
+            safe_float(
+                position[
+                    "market_value"
+                ]
+            )
         )
 
-    return total_market_value / account_value
+    return (
+        total_market_value
+        / account_value
+    )
 
 
 # ============================================================
 # RECHAZO
 # ============================================================
 
-def log_rejection(symbol, analysis, reason):
+def log_rejection(
+    symbol,
+    analysis,
+    reason
+):
+
     try:
+
         log_event(
             symbol=symbol,
             signal="COMPRAR",
-            entry_price=analysis.get("price", 0),
-            stop_price=analysis.get("stop_price", 0),
+            entry_price=analysis.get(
+                "price",
+                0
+            ),
+            stop_price=analysis.get(
+                "stop_price",
+                0
+            ),
             position_size=0,
             status="REJECTED",
             profit_loss=0.0
         )
 
     except Exception as error:
+
         print(
             RED
-            + f"[DB] Error registrando rechazo: {error}"
+            + f"[DB] Error registrando "
+              f"rechazo: {error}"
             + RESET
         )
 
     print(
         RED
-        + f"[RECHAZADO] {symbol} -> {reason}"
+        + f"[RECHAZADO] {symbol} -> "
+          f"{reason}"
         + RESET
     )
 
@@ -1071,71 +1906,148 @@ def build_analyzer_position(
     event,
     returns
 ):
-    signature = inspect.signature(PositionSnapshot)
+
+    signature = inspect.signature(
+        PositionSnapshot
+    )
+
     fields = signature.parameters
 
     market_value = abs(
-        safe_float(position.get("market_value", 0))
+        safe_float(
+            position.get(
+                "market_value",
+                0
+            )
+        )
     )
 
-    qty = safe_float(position.get("qty", 0))
-    entry_price = safe_float(
-        position.get("avg_entry_price", 0)
+    qty = safe_float(
+        position.get(
+            "qty",
+            0
+        )
     )
+
+    entry_price = safe_float(
+        position.get(
+            "avg_entry_price",
+            0
+        )
+    )
+
     current_price = safe_float(
-        position.get("current_price", 0)
+        position.get(
+            "current_price",
+            0
+        )
     )
 
     original_stop = 0.0
 
     if event:
+
         original_stop = safe_float(
             event.get(
                 "stop_price",
-                event.get("original_stop", 0)
+                event.get(
+                    "original_stop",
+                    0
+                )
             )
         )
 
     possible_values = {
-        "symbol": symbol,
-        "ticker": symbol,
-        "position_symbol": symbol,
-        "quantity": qty,
-        "qty": qty,
-        "position_size": qty,
-        "entry_price": entry_price,
-        "avg_entry_price": entry_price,
-        "current_price": current_price,
-        "price": current_price,
-        "market_value": market_value,
-        "position_value": market_value,
-        "original_stop": original_stop,
-        "stop_price": original_stop,
-        "current_stop": original_stop,
-        "returns": returns,
-        "return_series": returns,
-        "daily_returns": returns
+
+        "symbol":
+            symbol,
+
+        "ticker":
+            symbol,
+
+        "position_symbol":
+            symbol,
+
+        "quantity":
+            qty,
+
+        "qty":
+            qty,
+
+        "position_size":
+            qty,
+
+        "entry_price":
+            entry_price,
+
+        "avg_entry_price":
+            entry_price,
+
+        "current_price":
+            current_price,
+
+        "price":
+            current_price,
+
+        "market_value":
+            market_value,
+
+        "position_value":
+            market_value,
+
+        "original_stop":
+            original_stop,
+
+        "stop_price":
+            original_stop,
+
+        "current_stop":
+            original_stop,
+
+        "returns":
+            returns,
+
+        "return_series":
+            returns,
+
+        "daily_returns":
+            returns
     }
 
     kwargs = {}
 
     for name in fields:
+
         parameter = fields[name]
 
         if name == "self":
             continue
 
         if name in possible_values:
-            kwargs[name] = possible_values[name]
-        elif parameter.default is not inspect.Parameter.empty:
+
+            kwargs[name] = possible_values[
+                name
+            ]
+
+        elif (
+            parameter.default
+            is not inspect.Parameter.empty
+        ):
+
             continue
 
     try:
-        return PositionSnapshot(**kwargs)
+
+        return PositionSnapshot(
+            **kwargs
+        )
+
     except TypeError as error:
+
         raise RuntimeError(
-            "No se pudo construir PositionSnapshot "
-            f"para {symbol}: {error}"
+            "No se pudo construir "
+            "PositionSnapshot para "
+            f"{symbol}: {error}"
         )
 
 
@@ -1156,11 +2068,19 @@ def run_portfolio_analyzer(
     candidate_stop,
     candidate_qty
 ):
+
     snapshots = []
 
     for symbol, position in positions.items():
-        event = db_events.get(symbol)
-        returns = returns_cache.get(symbol, [])
+
+        event = db_events.get(
+            symbol
+        )
+
+        returns = returns_cache.get(
+            symbol,
+            []
+        )
 
         snapshot = build_analyzer_position(
             symbol=symbol,
@@ -1169,85 +2089,177 @@ def run_portfolio_analyzer(
             returns=returns
         )
 
-        snapshots.append(snapshot)
+        snapshots.append(
+            snapshot
+        )
 
-    candidate_returns = returns_cache.get(
-        candidate_symbol,
-        []
+    candidate_returns = (
+        returns_cache.get(
+            candidate_symbol,
+            []
+        )
     )
 
     method = analyzer.analyze_candidate
-    signature = inspect.signature(method)
+
+    signature = inspect.signature(
+        method
+    )
 
     available = {
-        "symbol": candidate_symbol,
-        "candidate_symbol": candidate_symbol,
-        "ticker": candidate_symbol,
-        "candidate_value": candidate_value,
-        "proposed_value": candidate_value,
-        "position_value": candidate_value,
-        "trade_value": candidate_value,
-        "candidate_price": candidate_price,
-        "entry_price": candidate_price,
-        "price": candidate_price,
-        "candidate_stop": candidate_stop,
-        "stop_price": candidate_stop,
-        "candidate_quantity": candidate_qty,
-        "quantity": candidate_qty,
-        "qty": candidate_qty,
-        "position_size": candidate_qty,
-        "account_value": equity,
-        "equity": equity,
-        "positions": snapshots,
-        "portfolio_positions": snapshots,
-        "existing_positions": snapshots,
-        "returns": candidate_returns,
-        "candidate_returns": candidate_returns,
-        "return_series": candidate_returns,
-        "daily_returns": candidate_returns,
-        "current_portfolio_risk": current_portfolio_risk,
-        "portfolio_risk": current_portfolio_risk
+
+        "symbol":
+            candidate_symbol,
+
+        "candidate_symbol":
+            candidate_symbol,
+
+        "ticker":
+            candidate_symbol,
+
+        "candidate_value":
+            candidate_value,
+
+        "proposed_value":
+            candidate_value,
+
+        "position_value":
+            candidate_value,
+
+        "trade_value":
+            candidate_value,
+
+        "candidate_price":
+            candidate_price,
+
+        "entry_price":
+            candidate_price,
+
+        "price":
+            candidate_price,
+
+        "candidate_stop":
+            candidate_stop,
+
+        "stop_price":
+            candidate_stop,
+
+        "candidate_quantity":
+            candidate_qty,
+
+        "quantity":
+            candidate_qty,
+
+        "qty":
+            candidate_qty,
+
+        "position_size":
+            candidate_qty,
+
+        "account_value":
+            equity,
+
+        "equity":
+            equity,
+
+        "positions":
+            snapshots,
+
+        "portfolio_positions":
+            snapshots,
+
+        "existing_positions":
+            snapshots,
+
+        "returns":
+            candidate_returns,
+
+        "candidate_returns":
+            candidate_returns,
+
+        "return_series":
+            candidate_returns,
+
+        "daily_returns":
+            candidate_returns,
+
+        "current_portfolio_risk":
+            current_portfolio_risk,
+
+        "portfolio_risk":
+            current_portfolio_risk
     }
 
     kwargs = {}
 
-    for name, parameter in signature.parameters.items():
+    for (
+        name,
+        parameter
+    ) in signature.parameters.items():
+
         if name == "self":
             continue
 
         if name in available:
+
             kwargs[name] = available[name]
 
-        elif parameter.default is not inspect.Parameter.empty:
+        elif (
+            parameter.default
+            is not inspect.Parameter.empty
+        ):
+
             continue
 
         else:
+
             raise RuntimeError(
-                "PortfolioAnalyzer.analyze_candidate "
-                f"requiere el argumento '{name}' "
-                "que MAIN V4 no pudo proporcionar."
+                "PortfolioAnalyzer."
+                "analyze_candidate "
+                f"requiere el argumento "
+                f"'{name}' que MAIN V4 "
+                "no pudo proporcionar."
             )
 
-    return method(**kwargs)
+    return method(
+        **kwargs
+    )
 
 
 # ============================================================
 # RESULTADO ANALYZER
 # ============================================================
 
-def analyzer_result_data(result):
+def analyzer_result_data(
+    result
+):
+
     if result is None:
+
         return {
             "approved": False,
             "score": 0,
-            "reasons": ["ANALYZER NO DEVOLVIÓ RESULTADO"]
+            "reasons": [
+                "ANALYZER NO DEVOLVIÓ RESULTADO"
+            ]
         }
 
-    if isinstance(result, dict):
+    if isinstance(
+        result,
+        dict
+    ):
+
         data = result
-    elif hasattr(result, "__dict__"):
+
+    elif hasattr(
+        result,
+        "__dict__"
+    ):
+
         data = vars(result)
+
     else:
+
         data = {}
 
         for name in (
@@ -1264,42 +2276,99 @@ def analyzer_result_data(result):
             "risk_increment",
             "remaining_risk_after"
         ):
-            if hasattr(result, name):
-                data[name] = getattr(result, name)
 
-    approved = bool(data.get("approved", False))
-    score = safe_float(data.get("score", 0))
+            if hasattr(
+                result,
+                name
+            ):
+
+                data[name] = getattr(
+                    result,
+                    name
+                )
+
+    approved = bool(
+        data.get(
+            "approved",
+            False
+        )
+    )
+
+    score = safe_float(
+        data.get(
+            "score",
+            0
+        )
+    )
 
     reasons = data.get(
         "reasons",
-        data.get("approval_reasons", [])
+        data.get(
+            "approval_reasons",
+            []
+        )
     )
 
     if reasons is None:
         reasons = []
 
-    if isinstance(reasons, str):
-        reasons = [reasons]
+    if isinstance(
+        reasons,
+        str
+    ):
 
-    reasons = list(reasons)
+        reasons = [
+            reasons
+        ]
+
+    reasons = list(
+        reasons
+    )
 
     return {
-        "approved": approved,
-        "score": score,
-        "reasons": reasons,
-        "projected_total_exposure": safe_float(
-            data.get("projected_total_exposure", 0)
-        ),
-        "projected_symbol_exposure": safe_float(
-            data.get("projected_symbol_exposure", 0)
-        ),
-        "risk_increment": safe_float(
-            data.get("risk_increment", 0)
-        ),
-        "remaining_risk_after": safe_float(
-            data.get("remaining_risk_after", 0)
-        ),
-        "raw": data
+        "approved":
+            approved,
+
+        "score":
+            score,
+
+        "reasons":
+            reasons,
+
+        "projected_total_exposure":
+            safe_float(
+                data.get(
+                    "projected_total_exposure",
+                    0
+                )
+            ),
+
+        "projected_symbol_exposure":
+            safe_float(
+                data.get(
+                    "projected_symbol_exposure",
+                    0
+                )
+            ),
+
+        "risk_increment":
+            safe_float(
+                data.get(
+                    "risk_increment",
+                    0
+                )
+            ),
+
+        "remaining_risk_after":
+            safe_float(
+                data.get(
+                    "remaining_risk_after",
+                    0
+                )
+            ),
+
+        "raw":
+            data
     }
 
 
@@ -1307,9 +2376,18 @@ def analyzer_result_data(result):
 # CLIENT ORDER ID
 # ============================================================
 
-def create_client_order_id(symbol):
-    timestamp = int(time.time() * 1000)
-    return f"AI_V4_{symbol}_{timestamp}"[:128]
+def create_client_order_id(
+    symbol
+):
+
+    timestamp = int(
+        time.time()
+        * 1000
+    )
+
+    return (
+        f"AI_V4_{symbol}_{timestamp}"
+    )[:128]
 
 
 # ============================================================
@@ -1322,7 +2400,12 @@ def submit_trade(
     quantity,
     stop_price
 ):
-    client_order_id = create_client_order_id(symbol)
+
+    client_order_id = (
+        create_client_order_id(
+            symbol
+        )
+    )
 
     order_request = MarketOrderRequest(
         symbol=symbol,
@@ -1330,9 +2413,14 @@ def submit_trade(
         side=OrderSide.BUY,
         time_in_force=TimeInForce.DAY,
         order_class=OrderClass.OTO,
+
         stop_loss=StopLossRequest(
-            stop_price=round(stop_price, 2)
+            stop_price=round(
+                stop_price,
+                2
+            )
         ),
+
         client_order_id=client_order_id
     )
 
@@ -1340,7 +2428,10 @@ def submit_trade(
         order_data=order_request
     )
 
-    return order, client_order_id
+    return (
+        order,
+        client_order_id
+    )
 
 
 # ============================================================
@@ -1350,6 +2441,7 @@ def submit_trade(
 def main():
 
     print_header()
+
     initialize_database()
 
     # --------------------------------------------------------
@@ -1357,30 +2449,39 @@ def main():
     # --------------------------------------------------------
 
     try:
+
         ai_ready = initialize_ai_engine()
 
         if ai_ready:
+
             print(
                 GREEN
-                + "AI Engine V1: ONLINE — MEMORIA ACTIVA"
+                + "AI Engine V1: ONLINE — "
+                  "MEMORIA ACTIVA"
                 + RESET
             )
+
         else:
+
             print(
                 YELLOW
                 + "AI Engine V1: NO DISPONIBLE"
                 + RESET
             )
+
             print(
                 YELLOW
-                + "El bot continuará sin memoria de IA."
+                + "El bot continuará sin "
+                  "memoria de IA."
                 + RESET
             )
 
     except Exception as error:
+
         print(
             YELLOW
-            + f"AI Engine: ERROR DE INICIALIZACIÓN: {error}"
+            + f"AI Engine: ERROR DE "
+              f"INICIALIZACIÓN: {error}"
             + RESET
         )
 
@@ -1391,13 +2492,19 @@ def main():
     # --------------------------------------------------------
 
     try:
-        trading_client, data_client = create_clients()
+
+        trading_client, data_client = (
+            create_clients()
+        )
+
     except Exception as error:
+
         print(
             RED
             + f"ERROR DE CONEXIÓN: {error}"
             + RESET
         )
+
         return
 
     # --------------------------------------------------------
@@ -1405,7 +2512,10 @@ def main():
     # --------------------------------------------------------
 
     try:
-        portfolio_analyzer = PortfolioAnalyzer()
+
+        portfolio_analyzer = (
+            PortfolioAnalyzer()
+        )
 
         print(
             GREEN
@@ -1414,12 +2524,15 @@ def main():
         )
 
     except Exception as error:
+
         print(
             RED
-            + "ERROR INICIALIZANDO PORTFOLIO ANALYZER: "
-            + str(error)
+            + "ERROR INICIALIZANDO "
+              "PORTFOLIO ANALYZER: "
+              + str(error)
             + RESET
         )
+
         return
 
     # --------------------------------------------------------
@@ -1427,27 +2540,65 @@ def main():
     # --------------------------------------------------------
 
     try:
-        account = get_account_snapshot(trading_client)
+
+        account = (
+            get_account_snapshot(
+                trading_client
+            )
+        )
+
     except Exception as error:
+
         print(
             RED
-            + f"ERROR OBTENIENDO CUENTA: {error}"
+            + f"ERROR OBTENIENDO CUENTA: "
+              f"{error}"
             + RESET
         )
+
         return
 
     equity = account["equity"]
-    buying_power = account["buying_power"]
 
-    print(CYAN + "=== CUENTA ===" + RESET)
-    print(f"Equity:       ${equity:,.2f}")
-    print(f"Buying Power: ${buying_power:,.2f}")
-    print(f"Cash:         ${account['cash']:,.2f}")
-    print(f"Estado:       {account['status']}")
+    buying_power = (
+        account["buying_power"]
+    )
+
+    print(
+        CYAN
+        + "=== CUENTA ==="
+        + RESET
+    )
+
+    print(
+        f"Equity:       ${equity:,.2f}"
+    )
+
+    print(
+        f"Buying Power: "
+        f"${buying_power:,.2f}"
+    )
+
+    print(
+        f"Cash:         "
+        f"${account['cash']:,.2f}"
+    )
+
+    print(
+        f"Estado:       "
+        f"{account['status']}"
+    )
+
     print()
 
     if equity <= 0:
-        print(RED + "CUENTA INVÁLIDA" + RESET)
+
+        print(
+            RED
+            + "CUENTA INVÁLIDA"
+            + RESET
+        )
+
         return
 
     # --------------------------------------------------------
@@ -1455,48 +2606,96 @@ def main():
     # --------------------------------------------------------
 
     try:
-        market_open, clock = check_market(trading_client)
+
+        market_open, clock = (
+            check_market(
+                trading_client
+            )
+        )
+
     except Exception as error:
+
         print(
             RED
-            + f"ERROR REVISANDO MERCADO: {error}"
+            + f"ERROR REVISANDO MERCADO: "
+              f"{error}"
             + RESET
         )
+
         return
 
     if not market_open:
+
         print(
             YELLOW
-            + "MERCADO CERRADO — NO SE OPERARÁ"
+            + "MERCADO CERRADO — "
+              "NO SE OPERARÁ"
             + RESET
         )
+
         return
 
-    print(GREEN + "MERCADO ABIERTO" + RESET)
+    print(
+        GREEN
+        + "MERCADO ABIERTO"
+        + RESET
+    )
+
     print()
 
     # --------------------------------------------------------
     # MÉTRICAS DEL DÍA
     # --------------------------------------------------------
 
-    trades_today = get_today_trade_count()
-    daily_loss = get_today_loss()
-    daily_profit_loss = get_today_profit_loss()
+    trades_today = (
+        get_today_trade_count()
+    )
 
-    print(CYAN + "=== ESTADO DEL DÍA ===" + RESET)
-    print(f"Operaciones: {trades_today}")
-    print(f"Pérdida acumulada: ${daily_loss:,.2f}")
-    print(f"P/L cerrado: ${daily_profit_loss:,.2f}")
+    daily_loss = (
+        get_today_loss()
+    )
+
+    daily_profit_loss = (
+        get_today_profit_loss()
+    )
+
+    print(
+        CYAN
+        + "=== ESTADO DEL DÍA ==="
+        + RESET
+    )
+
+    print(
+        f"Operaciones: "
+        f"{trades_today}"
+    )
+
+    print(
+        f"Pérdida acumulada: "
+        f"${daily_loss:,.2f}"
+    )
+
+    print(
+        f"P/L cerrado: "
+        f"${daily_profit_loss:,.2f}"
+    )
+
     print()
 
-    daily_limit = equity * MAX_DAILY_LOSS
+    daily_limit = (
+        equity
+        * MAX_DAILY_LOSS
+    )
 
     if daily_loss >= daily_limit:
+
         print(
             RED
-            + "KILL SWITCH: LÍMITE DE PÉRDIDA DIARIA"
+            + "KILL SWITCH: LÍMITE "
+              "DE PÉRDIDA DIARIA"
             + RESET
         )
+
         return
 
     # --------------------------------------------------------
@@ -1504,13 +2703,22 @@ def main():
     # --------------------------------------------------------
 
     try:
-        positions = get_positions(trading_client)
+
+        positions = (
+            get_positions(
+                trading_client
+            )
+        )
+
     except Exception as error:
+
         print(
             RED
-            + f"ERROR OBTENIENDO POSICIONES: {error}"
+            + f"ERROR OBTENIENDO "
+              f"POSICIONES: {error}"
             + RESET
         )
+
         return
 
     # --------------------------------------------------------
@@ -1518,28 +2726,56 @@ def main():
     # --------------------------------------------------------
 
     try:
-        open_orders = get_open_orders(trading_client)
+
+        open_orders = (
+            get_open_orders(
+                trading_client
+            )
+        )
+
     except Exception as error:
+
         print(
             RED
-            + f"ERROR OBTENIENDO ÓRDENES: {error}"
+            + f"ERROR OBTENIENDO "
+              f"ÓRDENES: {error}"
             + RESET
         )
+
         return
 
-    print(CYAN + "=== CARTERA ===" + RESET)
-    print(f"Posiciones abiertas: {len(positions)}")
-    print(f"Símbolos con órdenes: {len(open_orders)}")
+    print(
+        CYAN
+        + "=== CARTERA ==="
+        + RESET
+    )
+
+    print(
+        f"Posiciones abiertas: "
+        f"{len(positions)}"
+    )
+
+    print(
+        f"Símbolos con órdenes: "
+        f"{len(open_orders)}"
+    )
+
     print()
 
-    available_slots = MAX_OPEN_POSITIONS - len(positions)
+    available_slots = (
+        MAX_OPEN_POSITIONS
+        - len(positions)
+    )
 
     if available_slots <= 0:
+
         print(
             YELLOW
-            + "No hay espacio para nuevas posiciones."
+            + "No hay espacio para "
+              "nuevas posiciones."
             + RESET
         )
+
         return
 
     max_entries = min(
@@ -1551,60 +2787,107 @@ def main():
     # DB / RIESGO
     # --------------------------------------------------------
 
-    db_events = load_db_position_events(positions)
-
-    current_portfolio_risk, unknown_stop = (
-        calculate_current_portfolio_risk_safe(
-            equity,
-            positions,
-            db_events
+    db_events = (
+        load_db_position_events(
+            positions
         )
     )
 
-    current_exposure = calculate_current_exposure(
+    (
+        current_portfolio_risk,
+        unknown_stop
+    ) = calculate_current_portfolio_risk_safe(
         equity,
-        positions
+        positions,
+        db_events,
+        open_orders
     )
 
-    print(CYAN + "=== RIESGO ACTUAL ===" + RESET)
+    current_exposure = (
+        calculate_current_exposure(
+            equity,
+            positions
+        )
+    )
+
+    print(
+        CYAN
+        + "=== RIESGO ACTUAL ==="
+        + RESET
+    )
+
     print(
         f"Riesgo cartera: "
         f"{current_portfolio_risk * 100:.2f}%"
     )
+
     print(
         f"Exposición: "
         f"{current_exposure * 100:.2f}%"
     )
 
     if unknown_stop:
+
         print(
             YELLOW
-            + "ADVERTENCIA: existen posiciones "
-              "con stop desconocido."
+            + "ADVERTENCIA: existen "
+              "posiciones con stop "
+              "desconocido."
             + RESET
         )
+
         print(
             YELLOW
-            + "Riesgo tratado conservadoramente."
+            + "Riesgo tratado "
+              "conservadoramente."
             + RESET
         )
 
     print()
 
-    if current_exposure >= MAX_TOTAL_EXPOSURE:
+    # --------------------------------------------------------
+    # SEGURIDAD DE RIESGO
+    # --------------------------------------------------------
+
+    if unknown_stop:
+
         print(
             RED
-            + "EXPOSICIÓN MÁXIMA ALCANZADA."
+            + "NO SE ABRIRÁN NUEVAS "
+              "POSICIONES HASTA PODER "
+              "CUANTIFICAR EL STOP "
+              "DE TODAS LAS POSICIONES."
             + RESET
         )
+
+        return
+
+    if current_exposure >= (
+        MAX_TOTAL_EXPOSURE
+    ):
+
+        print(
+            RED
+            + "EXPOSICIÓN MÁXIMA "
+              "ALCANZADA."
+            + RESET
+        )
+
         return
 
     # --------------------------------------------------------
     # CACHE
     # --------------------------------------------------------
 
-    bars_cache = {BENCHMARK: None}
+    bars_cache = {
+        BENCHMARK: None
+    }
+
     returns_cache = {}
+
+    benchmark_available = False
+
+    benchmark_bars = []
 
     # --------------------------------------------------------
     # SPY
@@ -1617,43 +2900,82 @@ def main():
     )
 
     try:
-        benchmark_bars = get_daily_bars(
-            data_client,
-            BENCHMARK
-        )
-    except Exception as error:
-        print(
-            RED
-            + f"ERROR DESCARGANDO SPY: {error}"
-            + RESET
-        )
-        return
 
-    if len(benchmark_bars) < MIN_BARS:
-        print(
-            RED
-            + f"SPY NO TIENE SUFICIENTES DATOS: "
-              f"{len(benchmark_bars)}/{MIN_BARS} barras."
-            + RESET
+        benchmark_bars = (
+            get_daily_bars(
+                data_client,
+                BENCHMARK,
+                benchmark=True
+            )
         )
+
+    except Exception as error:
+
         print(
             YELLOW
-            + "El problema está en Market Data, "
-              "no en el scanner."
+            + f"ERROR DESCARGANDO SPY: "
+              f"{error}"
             + RESET
         )
-        return
 
-    bars_cache[BENCHMARK] = benchmark_bars
-    returns_cache[BENCHMARK] = calculate_returns(
-        benchmark_bars
-    )
+        benchmark_bars = []
 
-    print(
-        GREEN
-        + f"SPY listo: {len(benchmark_bars)} barras"
-        + RESET
-    )
+    if len(benchmark_bars) >= MIN_BARS:
+
+        benchmark_available = True
+
+        bars_cache[
+            BENCHMARK
+        ] = benchmark_bars
+
+        returns_cache[
+            BENCHMARK
+        ] = calculate_returns(
+            benchmark_bars
+        )
+
+        print(
+            GREEN
+            + f"SPY listo: "
+              f"{len(benchmark_bars)} barras"
+            + RESET
+        )
+
+    else:
+
+        # ----------------------------------------------------
+        # PARCHE CRÍTICO
+        # ----------------------------------------------------
+        #
+        # SPY NO DETIENE TODO EL BOT.
+        #
+        # El scanner podrá continuar.
+        # RS se marcará como N/D.
+        #
+        print(
+            YELLOW
+            + f"SPY no tiene suficientes "
+              f"datos utilizables: "
+              f"{len(benchmark_bars)}/{MIN_BARS}"
+            + RESET
+        )
+
+        print(
+            YELLOW
+            + "CONTINUANDO SIN "
+              "RELATIVE STRENGTH."
+            + RESET
+        )
+
+        print(
+            YELLOW
+            + "No se inventará el valor "
+              "de RS."
+            + RESET
+        )
+
+        benchmark_bars = []
+
     print()
 
     # --------------------------------------------------------
@@ -1661,32 +2983,50 @@ def main():
     # --------------------------------------------------------
 
     if positions:
+
         print(
             CYAN
-            + "=== DATOS DE CARTERA PARA CORRELACIÓN ==="
+            + "=== DATOS DE CARTERA "
+              "PARA CORRELACIÓN ==="
             + RESET
         )
 
     for symbol in positions:
+
         try:
+
             bars = get_daily_bars(
                 data_client,
                 symbol
             )
 
-            bars_cache[symbol] = bars
-            returns_cache[symbol] = calculate_returns(bars)
+            bars_cache[
+                symbol
+            ] = bars
 
-            time.sleep(REQUEST_DELAY)
+            returns_cache[
+                symbol
+            ] = calculate_returns(
+                bars
+            )
+
+            time.sleep(
+                REQUEST_DELAY
+            )
 
         except Exception as error:
+
             print(
                 YELLOW
-                + f"{symbol}: no se pudieron cargar retornos "
-                  f"({error})"
+                + f"{symbol}: no se "
+                  "pudieron cargar "
+                  f"retornos ({error})"
                 + RESET
             )
-            returns_cache[symbol] = []
+
+            returns_cache[
+                symbol
+            ] = []
 
     if positions:
         print()
@@ -1713,24 +3053,37 @@ def main():
             positions,
             open_orders
         ):
+
             print(
                 YELLOW
-                + f"{symbol:<6} BLOQUEADO "
+                + f"{symbol:<6} "
+                  "BLOQUEADO "
                   "(posición/orden existente)"
                 + RESET
             )
+
             continue
 
         try:
+
             bars = get_daily_bars(
                 data_client,
                 symbol
             )
 
-            time.sleep(REQUEST_DELAY)
+            time.sleep(
+                REQUEST_DELAY
+            )
 
-            bars_cache[symbol] = bars
-            returns_cache[symbol] = calculate_returns(bars)
+            bars_cache[
+                symbol
+            ] = bars
+
+            returns_cache[
+                symbol
+            ] = calculate_returns(
+                bars
+            )
 
             analysis = analyze_symbol(
                 symbol,
@@ -1739,21 +3092,34 @@ def main():
             )
 
             if analysis is None:
+
                 print(
                     YELLOW
-                    + f"{symbol:<6} datos insuficientes/filtro"
+                    + f"{symbol:<6} "
+                      "datos insuficientes/filtro"
                     + RESET
                 )
+
                 continue
 
-            record_signal_for_ai(analysis)
-            analyses.append(analysis)
-            print_analysis(analysis)
+            record_signal_for_ai(
+                analysis
+            )
+
+            analyses.append(
+                analysis
+            )
+
+            print_analysis(
+                analysis
+            )
 
         except Exception as error:
+
             print(
                 RED
-                + f"{symbol:<6} ERROR: {error}"
+                + f"{symbol:<6} ERROR: "
+                  f"{error}"
                 + RESET
             )
 
@@ -1779,24 +3145,38 @@ def main():
     )
 
     if not analyses:
+
         print(
             YELLOW
-            + "No se encontraron oportunidades."
+            + "No se encontraron "
+              "oportunidades."
             + RESET
         )
+
         return
 
     for index, analysis in enumerate(
         analyses[:10],
         start=1
     ):
+
+        rs_text = (
+            f"{analysis['relative_strength'] * 100:>6.2f}%"
+            if analysis.get(
+                "benchmark_available",
+                False
+            )
+            else "  N/D "
+        )
+
         print(
             f"{index:>2}. "
             f"{analysis['symbol']:<6} "
-            f"Score {analysis['score']:>3}/100 | "
-            f"RSI {analysis['rsi']:>5.1f} | "
-            f"RS "
-            f"{analysis['relative_strength'] * 100:>6.2f}%"
+            f"Score "
+            f"{analysis['score']:>3}/100 | "
+            f"RSI "
+            f"{analysis['rsi']:>5.1f} | "
+            f"RS {rs_text}"
         )
 
     print()
@@ -1812,18 +3192,23 @@ def main():
     ]
 
     if not candidates:
+
         print(
             YELLOW
-            + "Ningún activo pasó todos los filtros."
+            + "Ningún activo pasó "
+              "todos los filtros."
             + RESET
         )
+
         return
 
     print(
         GREEN
-        + f"Candidatos válidos: {len(candidates)}"
+        + f"Candidatos válidos: "
+          f"{len(candidates)}"
         + RESET
     )
+
     print()
 
     # ========================================================
@@ -1837,22 +3222,45 @@ def main():
         if executed >= max_entries:
             break
 
-        symbol = analysis["symbol"]
+        symbol = analysis[
+            "symbol"
+        ]
 
         print()
         print("=" * 72)
 
         print(
             MAGENTA
-            + f"ANALIZANDO ENTRADA: {symbol}"
+            + f"ANALIZANDO ENTRADA: "
+              f"{symbol}"
             + RESET
         )
 
-        print(f"Score:          {analysis['score']}/100")
-        print(f"Precio:         ${analysis['price']:.2f}")
-        print(f"RSI:            {analysis['rsi']:.2f}")
-        print(f"ATR:            ${analysis['atr']:.2f}")
-        print(f"Stop:           ${analysis['stop_price']:.2f}")
+        print(
+            f"Score:          "
+            f"{analysis['score']}/100"
+        )
+
+        print(
+            f"Precio:         "
+            f"${analysis['price']:.2f}"
+        )
+
+        print(
+            f"RSI:            "
+            f"{analysis['rsi']:.2f}"
+        )
+
+        print(
+            f"ATR:            "
+            f"${analysis['atr']:.2f}"
+        )
+
+        print(
+            f"Stop:           "
+            f"${analysis['stop_price']:.2f}"
+        )
+
         print(
             f"Distancia stop: "
             f"{analysis['stop_distance'] * 100:.2f}%"
@@ -1862,43 +3270,74 @@ def main():
         # POSITION SIZE
         # ----------------------------------------------------
 
-        position_size = calculate_position_size(
-            account_value=equity,
-            entry_price=analysis["price"],
-            stop_price=analysis["stop_price"],
-            risk_percent=MAX_RISK_PER_TRADE,
-            buying_power=buying_power
+        position_size = (
+            calculate_position_size(
+                account_value=equity,
+                entry_price=analysis[
+                    "price"
+                ],
+                stop_price=analysis[
+                    "stop_price"
+                ],
+                risk_percent=(
+                    MAX_RISK_PER_TRADE
+                ),
+                buying_power=(
+                    buying_power
+                )
+            )
         )
 
         if position_size <= 0:
+
             log_rejection(
                 symbol,
                 analysis,
-                "TAMAÑO DE POSICIÓN INVÁLIDO"
+                "TAMAÑO DE POSICIÓN "
+                "INVÁLIDO"
             )
+
             continue
 
-        position_value = calculate_position_value(
-            position_size,
-            analysis["price"]
+        position_value = (
+            calculate_position_value(
+                position_size,
+                analysis["price"]
+            )
         )
 
-        trade_risk = calculate_trade_risk(
-            position_size,
-            analysis["price"],
-            analysis["stop_price"]
+        trade_risk = (
+            calculate_trade_risk(
+                position_size,
+                analysis["price"],
+                analysis["stop_price"]
+            )
         )
 
-        trade_risk_percent = calculate_trade_risk_percent(
-            equity,
-            position_size,
-            analysis["price"],
-            analysis["stop_price"]
+        trade_risk_percent = (
+            calculate_trade_risk_percent(
+                equity,
+                position_size,
+                analysis["price"],
+                analysis["stop_price"]
+            )
         )
 
-        print(f"Acciones:       {position_size}")
-        print(f"Capital:        ${position_value:,.2f}")
-        print(f"Riesgo:         ${trade_risk:,.2f}")
+        print(
+            f"Acciones:       "
+            f"{position_size}"
+        )
+
+        print(
+            f"Capital:        "
+            f"${position_value:,.2f}"
+        )
+
+        print(
+            f"Riesgo:         "
+            f"${trade_risk:,.2f}"
+        )
+
         print(
             f"Riesgo %:       "
             f"{trade_risk_percent * 100:.2f}%"
@@ -1908,32 +3347,68 @@ def main():
         # BUYING POWER
         # ----------------------------------------------------
 
-        if position_value > buying_power:
+        if position_value > (
+            buying_power
+        ):
+
             log_rejection(
                 symbol,
                 analysis,
-                "BUYING POWER INSUFICIENTE"
+                "BUYING POWER "
+                "INSUFICIENTE"
             )
+
+            continue
+
+        # ----------------------------------------------------
+        # EXPOSICIÓN PROYECTADA
+        # ----------------------------------------------------
+
+        projected_exposure = (
+            current_exposure
+            + (
+                position_value
+                / equity
+            )
+        )
+
+        if projected_exposure > (
+            MAX_TOTAL_EXPOSURE
+        ):
+
+            log_rejection(
+                symbol,
+                analysis,
+                "EXPOSICIÓN TOTAL "
+                "EXCEDIDA"
+            )
+
             continue
 
         # ----------------------------------------------------
         # SYMBOL EXPOSURE
         # ----------------------------------------------------
 
-        symbol_ok, symbol_message = symbol_exposure_check(
-            account_value=equity,
-            symbol=symbol,
-            position_size=position_size,
-            entry_price=analysis["price"],
-            existing_symbol_value=0.0
+        symbol_ok, symbol_message = (
+            symbol_exposure_check(
+                account_value=equity,
+                symbol=symbol,
+                position_size=position_size,
+                entry_price=analysis[
+                    "price"
+                ],
+                existing_symbol_value=0.0
+            )
         )
 
         if not symbol_ok:
+
             log_rejection(
                 symbol,
                 analysis,
                 symbol_message
             )
+
             continue
 
         # ====================================================
@@ -1941,6 +3416,7 @@ def main():
         # ====================================================
 
         print()
+
         print(
             CYAN
             + "=== PORTFOLIO ANALYZER ==="
@@ -1948,37 +3424,52 @@ def main():
         )
 
         try:
-            analyzer_result = run_portfolio_analyzer(
-                analyzer=portfolio_analyzer,
-                equity=equity,
-                current_portfolio_risk=current_portfolio_risk,
-                positions=positions,
-                db_events=db_events,
-                returns_cache=returns_cache,
-                candidate_symbol=symbol,
-                candidate_value=position_value,
-                candidate_price=analysis["price"],
-                candidate_stop=analysis["stop_price"],
-                candidate_qty=position_size
+
+            analyzer_result = (
+                run_portfolio_analyzer(
+                    analyzer=portfolio_analyzer,
+                    equity=equity,
+                    current_portfolio_risk=(
+                        current_portfolio_risk
+                    ),
+                    positions=positions,
+                    db_events=db_events,
+                    returns_cache=returns_cache,
+                    candidate_symbol=symbol,
+                    candidate_value=position_value,
+                    candidate_price=analysis[
+                        "price"
+                    ],
+                    candidate_stop=analysis[
+                        "stop_price"
+                    ],
+                    candidate_qty=position_size
+                )
             )
 
-            analyzer_data = analyzer_result_data(
-                analyzer_result
+            analyzer_data = (
+                analyzer_result_data(
+                    analyzer_result
+                )
             )
 
         except Exception as error:
+
             print(
                 RED
-                + "ERROR DEL PORTFOLIO ANALYZER: "
-                + str(error)
+                + "ERROR DEL PORTFOLIO "
+                  "ANALYZER: "
+                  + str(error)
                 + RESET
             )
 
             log_rejection(
                 symbol,
                 analysis,
-                "PORTFOLIO ANALYZER ERROR"
+                "PORTFOLIO ANALYZER "
+                "ERROR"
             )
+
             continue
 
         print(
@@ -1991,39 +3482,69 @@ def main():
             f"{analyzer_data['score']:.1f}"
         )
 
-        if analyzer_data["projected_total_exposure"] > 0:
+        if (
+            analyzer_data[
+                "projected_total_exposure"
+            ] > 0
+        ):
+
             print(
                 f"Exposición proyectada: "
                 f"{analyzer_data['projected_total_exposure'] * 100:.2f}%"
             )
 
-        if analyzer_data["projected_symbol_exposure"] > 0:
+        if (
+            analyzer_data[
+                "projected_symbol_exposure"
+            ] > 0
+        ):
+
             print(
                 f"Exposición símbolo: "
                 f"{analyzer_data['projected_symbol_exposure'] * 100:.2f}%"
             )
 
-        if analyzer_data["risk_increment"] > 0:
+        if (
+            analyzer_data[
+                "risk_increment"
+            ] > 0
+        ):
+
             print(
                 f"Riesgo incremental: "
                 f"{analyzer_data['risk_increment'] * 100:.2f}%"
             )
 
-        if analyzer_data["reasons"]:
-            for reason in analyzer_data["reasons"]:
-                print("  • " + str(reason))
+        if analyzer_data[
+            "reasons"
+        ]:
 
-        if not analyzer_data["approved"]:
+            for reason in analyzer_data[
+                "reasons"
+            ]:
+
+                print(
+                    "  • "
+                    + str(reason)
+                )
+
+        if not analyzer_data[
+            "approved"
+        ]:
+
             log_rejection(
                 symbol,
                 analysis,
-                "PORTFOLIO ANALYZER RECHAZÓ LA ENTRADA"
+                "PORTFOLIO ANALYZER "
+                "RECHAZÓ LA ENTRADA"
             )
+
             continue
 
         print(
             GREEN
-            + "Portfolio Analyzer: AUTORIZADO"
+            + "Portfolio Analyzer: "
+              "AUTORIZADO"
             + RESET
         )
 
@@ -2031,59 +3552,85 @@ def main():
         # PORTFOLIO RISK CHECK
         # ====================================================
 
-        portfolio_risk_check_ok = (
+        projected_risk = (
             current_portfolio_risk
             + trade_risk_percent
+        )
+
+        portfolio_risk_check_ok = (
+            projected_risk
             <= MAX_PORTFOLIO_RISK
         )
 
-        projected_exposure = (
-            current_exposure
-            + (position_value / equity)
-        )
-
         if not portfolio_risk_check_ok:
+
             log_rejection(
                 symbol,
                 analysis,
-                "RIESGO TOTAL DE CARTERA EXCEDIDO"
+                "RIESGO TOTAL DE "
+                "CARTERA EXCEDIDO"
             )
+
             continue
 
-        if projected_exposure > MAX_TOTAL_EXPOSURE:
+        if projected_exposure > (
+            MAX_TOTAL_EXPOSURE
+        ):
+
             log_rejection(
                 symbol,
                 analysis,
-                "EXPOSICIÓN TOTAL EXCEDIDA"
+                "EXPOSICIÓN TOTAL "
+                "EXCEDIDA"
             )
+
             continue
 
         # ====================================================
         # RISK MANAGER V3
         # ====================================================
 
-        approved, risk_message = risk_check(
-            signal="COMPRAR",
-            account_value=equity,
-            entry_price=analysis["price"],
-            stop_price=analysis["stop_price"],
-            daily_loss=daily_loss,
-            trades_today=trades_today,
-            current_portfolio_risk=current_portfolio_risk,
-            open_positions=len(positions),
-            current_exposure=current_exposure,
-            buying_power=buying_power,
-            existing_symbol_value=0.0
+        approved, risk_message = (
+            risk_check(
+                signal="COMPRAR",
+                account_value=equity,
+                entry_price=analysis[
+                    "price"
+                ],
+                stop_price=analysis[
+                    "stop_price"
+                ],
+                daily_loss=daily_loss,
+                trades_today=trades_today,
+                current_portfolio_risk=(
+                    current_portfolio_risk
+                ),
+                open_positions=len(
+                    positions
+                ),
+                current_exposure=(
+                    current_exposure
+                ),
+                buying_power=(
+                    buying_power
+                ),
+                existing_symbol_value=0.0
+            )
         )
 
-        print(f"Risk Manager: {risk_message}")
+        print(
+            f"Risk Manager: "
+            f"{risk_message}"
+        )
 
         if not approved:
+
             log_rejection(
                 symbol,
                 analysis,
                 risk_message
             )
+
             continue
 
         print(
@@ -2097,48 +3644,71 @@ def main():
         # ====================================================
 
         try:
-            fresh_account = get_account_snapshot(
-                trading_client
+
+            fresh_account = (
+                get_account_snapshot(
+                    trading_client
+                )
             )
 
-            fresh_positions = get_positions(
-                trading_client
+            fresh_positions = (
+                get_positions(
+                    trading_client
+                )
             )
 
-            fresh_orders = get_open_orders(
-                trading_client
+            fresh_orders = (
+                get_open_orders(
+                    trading_client
+                )
             )
 
         except Exception as error:
+
             log_rejection(
                 symbol,
                 analysis,
-                f"ERROR DE SINCRONIZACIÓN: {error}"
+                f"ERROR DE "
+                f"SINCRONIZACIÓN: "
+                f"{error}"
             )
+
             continue
 
         fresh_equity = safe_float(
-            fresh_account["equity"]
+            fresh_account[
+                "equity"
+            ]
         )
 
         fresh_buying_power = safe_float(
-            fresh_account["buying_power"]
+            fresh_account[
+                "buying_power"
+            ]
         )
 
         if fresh_equity <= 0:
+
             log_rejection(
                 symbol,
                 analysis,
-                "EQUITY INVÁLIDO EN ÚLTIMA COMPROBACIÓN"
+                "EQUITY INVÁLIDO EN "
+                "ÚLTIMA COMPROBACIÓN"
             )
+
             continue
 
-        if position_value > fresh_buying_power:
+        if position_value > (
+            fresh_buying_power
+        ):
+
             log_rejection(
                 symbol,
                 analysis,
-                "BUYING POWER CAMBIÓ ANTES DE EJECUTAR"
+                "BUYING POWER CAMBIÓ "
+                "ANTES DE EJECUTAR"
             )
+
             continue
 
         if symbol_is_locked(
@@ -2146,19 +3716,60 @@ def main():
             fresh_positions,
             fresh_orders
         ):
+
             log_rejection(
                 symbol,
                 analysis,
-                "EL ACTIVO SE BLOQUEÓ DURANTE EL CICLO"
+                "EL ACTIVO SE BLOQUEÓ "
+                "DURANTE EL CICLO"
             )
+
             continue
 
-        if len(fresh_positions) >= MAX_OPEN_POSITIONS:
+        if len(
+            fresh_positions
+        ) >= MAX_OPEN_POSITIONS:
+
             log_rejection(
                 symbol,
                 analysis,
-                "SE ALCANZÓ EL MÁXIMO DE POSICIONES"
+                "SE ALCANZÓ EL MÁXIMO "
+                "DE POSICIONES"
             )
+
+            continue
+
+        # ----------------------------------------------------
+        # REVALIDACIÓN DE EXPOSICIÓN
+        # ----------------------------------------------------
+
+        fresh_exposure = (
+            calculate_current_exposure(
+                fresh_equity,
+                fresh_positions
+            )
+        )
+
+        fresh_projected_exposure = (
+            fresh_exposure
+            + (
+                position_value
+                / fresh_equity
+            )
+        )
+
+        if fresh_projected_exposure > (
+            MAX_TOTAL_EXPOSURE
+        ):
+
+            log_rejection(
+                symbol,
+                analysis,
+                "EXPOSICIÓN EXCEDIDA "
+                "EN ÚLTIMA "
+                "SINCRONIZACIÓN"
+            )
+
             continue
 
         # ====================================================
@@ -2169,36 +3780,53 @@ def main():
 
         print(
             GREEN
-            + f"🔥 AUTORIZADO FINAL: COMPRAR {symbol}"
+            + f"🔥 AUTORIZADO FINAL: "
+              f"COMPRAR {symbol}"
             + RESET
         )
 
         try:
-            order, client_order_id = submit_trade(
-                trading_client=trading_client,
-                symbol=symbol,
-                quantity=position_size,
-                stop_price=analysis["stop_price"]
+
+            order, client_order_id = (
+                submit_trade(
+                    trading_client=(
+                        trading_client
+                    ),
+                    symbol=symbol,
+                    quantity=position_size,
+                    stop_price=analysis[
+                        "stop_price"
+                    ]
+                )
             )
 
         except Exception as error:
+
             print(
                 RED
-                + f"ERROR ENVIANDO ORDEN {symbol}: {error}"
+                + f"ERROR ENVIANDO "
+                  f"ORDEN {symbol}: "
+                  f"{error}"
                 + RESET
             )
 
             try:
+
                 log_event(
                     symbol=symbol,
                     signal="COMPRAR",
-                    entry_price=analysis["price"],
-                    stop_price=analysis["stop_price"],
+                    entry_price=analysis[
+                        "price"
+                    ],
+                    stop_price=analysis[
+                        "stop_price"
+                    ],
                     position_size=position_size,
                     status="ORDER_ERROR",
                     profit_loss=0.0,
                     client_order_id=None
                 )
+
             except Exception:
                 pass
 
@@ -2208,18 +3836,31 @@ def main():
         # REGISTRO
         # ====================================================
 
-        order_id = getattr(order, "id", None)
+        order_id = getattr(
+            order,
+            "id",
+            None
+        )
 
         order_status = str(
-            getattr(order, "status", "SUBMITTED")
+            getattr(
+                order,
+                "status",
+                "SUBMITTED"
+            )
         )
 
         try:
+
             event_id = log_event(
                 symbol=symbol,
                 signal="COMPRAR",
-                entry_price=analysis["price"],
-                stop_price=analysis["stop_price"],
+                entry_price=analysis[
+                    "price"
+                ],
+                stop_price=analysis[
+                    "stop_price"
+                ],
                 position_size=position_size,
                 status=order_status,
                 profit_loss=0.0,
@@ -2228,15 +3869,18 @@ def main():
             )
 
         except Exception as error:
+
             event_id = None
 
             print(
                 RED
-                + f"ERROR GUARDANDO EVENTO DB: {error}"
+                + f"ERROR GUARDANDO "
+                  f"EVENTO DB: {error}"
                 + RESET
             )
 
         print()
+
         print(
             GREEN
             + "================================================"
@@ -2249,14 +3893,45 @@ def main():
             + RESET
         )
 
-        print(f"Cantidad:       {position_size}")
-        print(f"Precio aprox.:  ${analysis['price']:.2f}")
-        print(f"Stop:           ${analysis['stop_price']:.2f}")
-        print(f"Score:          {analysis['score']}/100")
-        print(f"Order ID:       {order_id}")
-        print(f"Client ID:      {client_order_id}")
-        print(f"DB Event:       {event_id}")
-        print(f"Estado:         {order_status}")
+        print(
+            f"Cantidad:       "
+            f"{position_size}"
+        )
+
+        print(
+            f"Precio aprox.:  "
+            f"${analysis['price']:.2f}"
+        )
+
+        print(
+            f"Stop:           "
+            f"${analysis['stop_price']:.2f}"
+        )
+
+        print(
+            f"Score:          "
+            f"{analysis['score']}/100"
+        )
+
+        print(
+            f"Order ID:       "
+            f"{order_id}"
+        )
+
+        print(
+            f"Client ID:      "
+            f"{client_order_id}"
+        )
+
+        print(
+            f"DB Event:       "
+            f"{event_id}"
+        )
+
+        print(
+            f"Estado:         "
+            f"{order_status}"
+        )
 
         print(
             GREEN
@@ -2264,10 +3939,21 @@ def main():
             + RESET
         )
 
+        # ----------------------------------------------------
+        # ACTUALIZACIÓN LOCAL
+        # ----------------------------------------------------
+
         executed += 1
+
         trades_today += 1
-        current_portfolio_risk += trade_risk_percent
-        current_exposure = projected_exposure
+
+        current_portfolio_risk = (
+            projected_risk
+        )
+
+        current_exposure = (
+            fresh_projected_exposure
+        )
 
         buying_power = (
             fresh_buying_power
@@ -2275,12 +3961,24 @@ def main():
         )
 
         positions[symbol] = {
-            "symbol": symbol,
-            "qty": position_size,
-            "market_value": position_value,
-            "avg_entry_price": analysis["price"],
-            "current_price": analysis["price"],
-            "unrealized_pl": 0.0
+
+            "symbol":
+                symbol,
+
+            "qty":
+                position_size,
+
+            "market_value":
+                position_value,
+
+            "avg_entry_price":
+                analysis["price"],
+
+            "current_price":
+                analysis["price"],
+
+            "unrealized_pl":
+                0.0
         }
 
         if executed >= max_entries:
@@ -2291,60 +3989,87 @@ def main():
     # ========================================================
 
     print()
+
     print("=" * 72)
+
     print(
         CYAN
         + "              RESUMEN DEL CICLO"
         + RESET
     )
+
     print("=" * 72)
 
     print(
-        f"Activos escaneados:     {len(SYMBOLS) - 1}"
+        f"Activos escaneados:     "
+        f"{len(SYMBOLS) - 1}"
     )
+
     print(
-        f"Activos analizados:     {len(analyses)}"
+        f"Activos analizados:     "
+        f"{len(analyses)}"
     )
+
     print(
-        f"Candidatos:             {len(candidates)}"
+        f"Candidatos:             "
+        f"{len(candidates)}"
     )
+
     print(
-        f"Nuevas entradas:        {executed}"
+        f"Nuevas entradas:        "
+        f"{executed}"
     )
+
     print(
-        f"Posiciones actuales:    {len(positions)}"
+        f"Posiciones actuales:    "
+        f"{len(positions)}"
     )
+
     print(
         f"Riesgo cartera aprox.:  "
         f"{current_portfolio_risk * 100:.2f}%"
     )
+
     print(
         f"Exposición aprox.:      "
         f"{current_exposure * 100:.2f}%"
     )
+
     print(
         f"Buying Power restante:  "
         f"${buying_power:,.2f}"
     )
+
     print()
 
     if executed == 0:
+
         print(
             YELLOW
-            + "El bot no abrió operaciones en este ciclo."
+            + "El bot no abrió operaciones "
+              "en este ciclo."
             + RESET
         )
+
     else:
+
         print(
             GREEN
-            + f"El bot ejecutó {executed} nueva(s) entrada(s)."
+            + f"El bot ejecutó "
+              f"{executed} nueva(s) entrada(s)."
             + RESET
         )
 
     print()
+
     print("=" * 72)
-    print("       AI TRADER V4 — CICLO TERMINADO")
+
+    print(
+        "       AI TRADER V4 — CICLO TERMINADO"
+    )
+
     print("=" * 72)
+
     print()
 
 
@@ -2353,19 +4078,26 @@ def main():
 # ============================================================
 
 if __name__ == "__main__":
+
     try:
+
         main()
 
     except KeyboardInterrupt:
+
         print()
+
         print(
             YELLOW
-            + "Ejecución detenida manualmente."
+            + "Ejecución detenida "
+              "manualmente."
             + RESET
         )
 
     except Exception as error:
+
         print()
+
         print(
             RED
             + "================================================"
@@ -2374,7 +4106,8 @@ if __name__ == "__main__":
 
         print(
             RED
-            + "KILL SWITCH — ERROR NO CONTROLADO"
+            + "KILL SWITCH — ERROR "
+              "NO CONTROLADO"
             + RESET
         )
 
@@ -2385,10 +4118,12 @@ if __name__ == "__main__":
         )
 
         print()
+
         traceback.print_exc()
 
         print(
             RED
-            + "NO SE INTENTARÁN MÁS ÓRDENES."
+            + "NO SE INTENTARÁN MÁS "
+              "ÓRDENES."
             + RESET
         )
