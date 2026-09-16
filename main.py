@@ -1,8 +1,6 @@
 # ============================================================
-# AI TRADER — MAIN V4 PANTERA
+# AI TRADER — MAIN V4 PANTERA + AI ENGINE V1
 # ============================================================
-#
-# CEREBRO MULTI-ACTIVO
 #
 # FLUJO:
 #
@@ -14,6 +12,8 @@
 #      ↓
 #   SIGNAL / SCORE
 #      ↓
+#   AI ENGINE — MEMORIA
+#      ↓
 #   PORTFOLIO ANALYZER
 #      ↓
 #   RISK MANAGER V3
@@ -23,6 +23,10 @@
 #   EXECUTOR
 #      ↓
 #   DATABASE
+#
+# IMPORTANTE:
+# AI ENGINE V1 NO AUTORIZA NI RECHAZA OPERACIONES.
+# SOLAMENTE REGISTRA LA EXPERIENCIA DE LAS SEÑALES.
 #
 # ============================================================
 
@@ -81,6 +85,15 @@ from database import (
     get_today_loss,
     get_today_profit_loss,
     get_open_position_event
+)
+
+# ============================================================
+# AI ENGINE
+# ============================================================
+
+from ai_engine import (
+    initialize_ai_engine,
+    record_ai_signal
 )
 
 
@@ -203,7 +216,7 @@ def print_header():
 
     print()
     print("=" * 72)
-    print("              AI TRADER — V4 PANTERA")
+    print("        AI TRADER — V4 PANTERA + AI ENGINE V1")
     print("=" * 72)
     print()
 
@@ -892,6 +905,49 @@ def analyze_symbol(
         )
     )
 
+    # --------------------------------------------------------
+    # DATOS EXTRA PARA AI ENGINE
+    # --------------------------------------------------------
+
+    volume_ratio = 0.0
+
+    if (
+        average_volume is not None
+        and average_volume > 0
+    ):
+
+        volume_ratio = (
+            current_volume
+            / average_volume
+        )
+
+    price_vs_ema_pct = 0.0
+
+    if ema_value > 0:
+
+        price_vs_ema_pct = (
+            price / ema_value
+            - 1.0
+        )
+
+    price_vs_sma_pct = 0.0
+
+    if sma_value > 0:
+
+        price_vs_sma_pct = (
+            price / sma_value
+            - 1.0
+        )
+
+    trend_strength = 0.0
+
+    if sma_value > 0:
+
+        trend_strength = (
+            ema_value / sma_value
+            - 1.0
+        )
+
     return {
         "symbol": symbol,
         "price": price,
@@ -902,11 +958,15 @@ def analyze_symbol(
         "atr_percent": atr_percent,
         "average_volume": average_volume,
         "current_volume": current_volume,
+        "volume_ratio": volume_ratio,
         "relative_strength": (
             relative_strength
             if relative_strength is not None
             else 0.0
         ),
+        "price_vs_ema_pct": price_vs_ema_pct,
+        "price_vs_sma_pct": price_vs_sma_pct,
+        "trend_strength": trend_strength,
         "trend_score": trend_score,
         "rsi_score": rsi_score,
         "momentum_score": momentum_score,
@@ -924,6 +984,79 @@ def analyze_symbol(
         "stop_price": stop_price,
         "stop_distance": stop_distance
     }
+
+
+# ============================================================
+# AI ENGINE — REGISTRAR SEÑAL
+# ============================================================
+
+def record_signal_for_ai(analysis):
+
+    """
+    Guarda la señal en AI Engine.
+
+    IMPORTANTE:
+    Esta función NO modifica buy_signal.
+    Tampoco aprueba/rechaza operaciones.
+
+    Solamente construye memoria histórica.
+    """
+
+    try:
+
+        experience_id = record_ai_signal(
+            symbol=analysis["symbol"],
+            score=analysis["score"],
+            rsi=analysis["rsi"],
+            atr_pct=analysis["atr_percent"],
+            volume_ratio=analysis["volume_ratio"],
+            relative_strength=analysis["relative_strength"],
+            price_vs_ema_pct=analysis["price_vs_ema_pct"],
+            price_vs_sma_pct=analysis["price_vs_sma_pct"],
+            trend_strength=analysis["trend_strength"],
+            metadata={
+                "buy_signal": analysis["buy_signal"],
+                "trend_score": analysis["trend_score"],
+                "rsi_score": analysis["rsi_score"],
+                "momentum_score": analysis["momentum_score"],
+                "volume_score": analysis["volume_score"],
+                "relative_score": analysis["relative_score"],
+                "volatility_score": analysis["volatility_score"],
+                "stop_distance": analysis["stop_distance"],
+                "engine": "V4_PANTERA"
+            }
+        )
+
+        if experience_id is not None:
+
+            print(
+                GREEN
+                + f"[AI MEMORY] {analysis['symbol']} "
+                  f"registrado — ID {experience_id}"
+                + RESET
+            )
+
+        else:
+
+            print(
+                YELLOW
+                + f"[AI MEMORY] {analysis['symbol']} "
+                  "no pudo registrarse"
+                + RESET
+            )
+
+        return experience_id
+
+    except Exception as error:
+
+        print(
+            YELLOW
+            + f"[AI MEMORY] Error registrando "
+              f"{analysis['symbol']}: {error}"
+            + RESET
+        )
+
+        return None
 
 
 # ============================================================
@@ -1139,14 +1272,6 @@ def build_analyzer_position(
     returns
 ):
 
-    """
-    Adaptador defensivo.
-
-    Permite que el MAIN entregue a PositionSnapshot
-    los campos disponibles sin depender de nombres
-    internos innecesarios.
-    """
-
     signature = inspect.signature(
         PositionSnapshot
     )
@@ -1274,13 +1399,6 @@ def run_portfolio_analyzer(
     candidate_qty
 ):
 
-    """
-    Integra el Portfolio Analyzer sin convertirlo
-    en autoridad final.
-
-    El Risk Manager sigue teniendo la última palabra.
-    """
-
     snapshots = []
 
     for symbol, position in positions.items():
@@ -1307,11 +1425,6 @@ def run_portfolio_analyzer(
         candidate_symbol,
         []
     )
-
-    # --------------------------------------------------------
-    # Intentamos utilizar la API actual del analyzer
-    # mediante nombres de argumentos.
-    # --------------------------------------------------------
 
     method = analyzer.analyze_candidate
 
@@ -1393,11 +1506,6 @@ def run_portfolio_analyzer(
 # ============================================================
 
 def analyzer_result_data(result):
-
-    """
-    Convierte dataclass/dict/objeto en información
-    utilizable por MAIN.
-    """
 
     if result is None:
 
@@ -1566,6 +1674,46 @@ def main():
     print_header()
 
     initialize_database()
+
+    # --------------------------------------------------------
+    # AI ENGINE
+    # --------------------------------------------------------
+
+    try:
+
+        ai_ready = initialize_ai_engine()
+
+        if ai_ready:
+
+            print(
+                GREEN
+                + "AI Engine V1: ONLINE — MEMORIA ACTIVA"
+                + RESET
+            )
+
+        else:
+
+            print(
+                YELLOW
+                + "AI Engine V1: NO DISPONIBLE"
+                + RESET
+            )
+
+            print(
+                YELLOW
+                + "El bot continuará sin memoria de IA."
+                + RESET
+            )
+
+    except Exception as error:
+
+        print(
+            YELLOW
+            + f"AI Engine: ERROR DE INICIALIZACIÓN: {error}"
+            + RESET
+        )
+
+    print()
 
     # --------------------------------------------------------
     # CLIENTES
@@ -2068,6 +2216,14 @@ def main():
 
                 continue
 
+            # ------------------------------------------------
+            # AI ENGINE — MEMORIA
+            # ------------------------------------------------
+
+            record_signal_for_ai(
+                analysis
+            )
+
             analyses.append(
                 analysis
             )
@@ -2352,10 +2508,6 @@ def main():
                 analysis,
                 "PORTFOLIO ANALYZER ERROR"
             )
-
-            # Fail closed:
-            # si el cerebro de cartera falla,
-            # no se manda la operación.
 
             continue
 
@@ -2741,10 +2893,6 @@ def main():
             - position_value
         )
 
-        # ----------------------------------------------------
-        # REFLEJAR POSICIÓN LOCAL
-        # ----------------------------------------------------
-
         positions[symbol] = {
             "symbol": symbol,
             "qty": position_size,
@@ -2753,10 +2901,6 @@ def main():
             "current_price": analysis["price"],
             "unrealized_pl": 0.0
         }
-
-        # ----------------------------------------------------
-        # CONTINUAR
-        # ----------------------------------------------------
 
         if executed >= max_entries:
 
@@ -2832,7 +2976,7 @@ def main():
 
     print()
     print("=" * 72)
-    print("             AI TRADER V4 — CICLO TERMINADO")
+    print("       AI TRADER V4 — CICLO TERMINADO")
     print("=" * 72)
     print()
 
