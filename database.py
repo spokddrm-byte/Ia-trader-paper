@@ -1,164 +1,191 @@
 """
-============================================================
-AI TRADER — DATABASE ENGINE
-============================================================
+AI TRADER — DATABASE V5.1 OMNIPRESENTE
+=======================================
 
-Version: 5.0 OMNIPRESENT
+Base de datos central del bot.
 
-Purpose:
-    Persistent memory, trade lifecycle, position state,
-    reconciliation, auditing, performance foundation and
-    system telemetry.
+Objetivos:
+- Historial de operaciones
+- Estado actual de posiciones
+- Estado de órdenes Alpaca
+- Idempotencia
+- Reconciliación Alpaca <-> SQLite
+- Auditoría
+- Eventos del sistema
+- Snapshots de portafolio
+- Métricas básicas
+- Migraciones aditivas
+- Backups
+- Compatibilidad con versiones anteriores
 
-IMPORTANT:
-    - Never deletes existing trade history.
-    - Alpaca remains the source of truth for real positions.
-    - SQLite stores persistent bot state and historical evidence.
-    - Designed to remain compatible with previous V3/V4 code.
-
-Architecture:
-
-    ALPACA
-       │
-       ▼
-    EXECUTION
-       │
-       ├──────────────► trade_events
-       │
-       ├──────────────► position_state
-       │
-       ├──────────────► order_state
-       │
-       └──────────────► audit_log
-
-    SYSTEM
-       │
-       ├──────────────► system_events
-       ├──────────────► portfolio_snapshots
-       └──────────────► reconciliation_log
-
-============================================================
+IMPORTANTE:
+- SQLite es persistencia/local state.
+- Alpaca sigue siendo la fuente de verdad para posiciones y órdenes reales.
+- Nunca se eliminan datos durante una migración.
 """
 
-import os
-import json
-import sqlite3
+from __future__ import annotations
+
 import hashlib
-from datetime import datetime, timezone, date
-from typing import Optional, Dict, Any, List
+import json
+import os
+import shutil
+import sqlite3
+import tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence
 
 
 # ============================================================
-# CONFIGURATION
+# CONFIGURACIÓN
 # ============================================================
 
-DATABASE_PATH = os.getenv(
-    "DATABASE_PATH",
-    "trade_history.db"
-)
+DATABASE_PATH = os.getenv("DATABASE_PATH", "trade_history.db")
 
 DB_TIMEOUT = 30
+DB_BUSY_TIMEOUT_MS = 30000
 
 SCHEMA_VERSION = 5
-
-BOT_VERSION = os.getenv(
-    "BOT_VERSION",
-    "V5 OMNIPRESENT"
-)
+BOT_VERSION = os.getenv("BOT_VERSION", "V5.1 OMNIPRESENTE")
 
 
 # ============================================================
-# TIME
+# TIEMPO
 # ============================================================
 
 def now_iso() -> str:
-    """UTC timestamp with second precision."""
-
-    return datetime.now(
-        timezone.utc
-    ).isoformat(
-        timespec="seconds"
-    )
+    """UTC actual en formato ISO 8601."""
+    return datetime.now(timezone.utc).isoformat()
 
 
 def today_prefix() -> str:
-    """UTC date prefix."""
-
-    return datetime.now(
-        timezone.utc
-    ).date().isoformat()
+    """Fecha UTC actual YYYY-MM-DD."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
 # ============================================================
-# CONNECTION
+# CONEXIÓN
 # ============================================================
 
-def get_connection():
+def get_connection() -> sqlite3.Connection:
     """
-    Open a robust SQLite connection.
-
-    WAL allows safer concurrent reads/writes.
+    Abre conexión SQLite configurada para operación estable.
     """
-
     conn = sqlite3.connect(
         DATABASE_PATH,
-        timeout=DB_TIMEOUT
+        timeout=DB_TIMEOUT,
+        check_same_thread=False,
     )
 
     conn.row_factory = sqlite3.Row
 
-    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute(f"PRAGMA busy_timeout={DB_BUSY_TIMEOUT_MS}")
     conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
 
     return conn
 
 
+def _connect() -> sqlite3.Connection:
+    """Alias interno."""
+    return get_connection()
+
+
 # ============================================================
-# JSON HELPERS
+# HELPERS
 # ============================================================
 
-def json_dumps(data: Any) -> Optional[str]:
-    """Safely serialize metadata."""
-
-    if data is None:
+def _json_dumps(value: Any) -> Optional[str]:
+    if value is None:
         return None
 
     try:
         return json.dumps(
-            data,
+            value,
             ensure_ascii=False,
             separators=(",", ":"),
-            default=str
+            default=str,
         )
     except Exception:
-        return json.dumps(
-            {"serialization_error": str(data)}
-        )
+        return json.dumps(str(value), ensure_ascii=False)
 
 
-def json_loads(data: Optional[str]) -> Any:
-    """Safely deserialize metadata."""
-
-    if not data:
+def _json_loads(value: Any) -> Any:
+    if value is None:
         return None
 
+    if isinstance(value, (dict, list)):
+        return value
+
     try:
-        return json.loads(data)
+        return json.loads(value)
     except Exception:
-        return data
+        return value
+
+
+def _row_to_dict(row: Optional[sqlite3.Row]) -> Optional[Dict[str, Any]]:
+    if row is None:
+        return None
+
+    return dict(row)
+
+
+def _rows_to_dicts(rows: Sequence[sqlite3.Row]) -> List[Dict[str, Any]]:
+    return [dict(row) for row in rows]
+
+
+def _safe_float(value: Any, default: Optional[float] = None) -> Optional[float]:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_int(value: Any, default: Optional[int] = None) -> Optional[int]:
+    try:
+        if value is None:
+            return default
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _normalize_symbol(symbol: Any) -> str:
+    return str(symbol or "").strip().upper()
+
+
+def _event_key(
+    symbol: str,
+    event_type: str,
+    order_id: Optional[str] = None,
+    timestamp: Optional[str] = None,
+    extra: Optional[Any] = None,
+) -> str:
+    """
+    Genera una clave determinista para evitar eventos duplicados.
+    """
+    raw = "|".join(
+        [
+            _normalize_symbol(symbol),
+            str(event_type or "").strip().upper(),
+            str(order_id or ""),
+            str(timestamp or ""),
+            _json_dumps(extra) or "",
+        ]
+    )
+
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 # ============================================================
 # SCHEMA HELPERS
 # ============================================================
 
-def table_exists(
-    conn,
-    table_name: str
-) -> bool:
-
+def table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
     row = conn.execute(
         """
         SELECT name
@@ -166,75 +193,64 @@ def table_exists(
         WHERE type='table'
           AND name=?
         """,
-        (table_name,)
+        (table_name,),
     ).fetchone()
 
     return row is not None
 
 
 def get_columns(
-    conn,
-    table_name: str
-) -> set:
-
+    conn: sqlite3.Connection,
+    table_name: str,
+) -> List[str]:
     if not table_exists(conn, table_name):
-        return set()
+        return []
 
     rows = conn.execute(
-        f"PRAGMA table_info({table_name})"
+        f'PRAGMA table_info("{table_name}")'
     ).fetchall()
 
-    return {
-        row["name"]
-        for row in rows
-    }
+    return [row["name"] for row in rows]
 
 
 def add_column_if_missing(
-    conn,
+    conn: sqlite3.Connection,
     table_name: str,
     column_name: str,
-    column_type: str
-):
-
-    columns = get_columns(
-        conn,
-        table_name
-    )
+    column_definition: str,
+) -> None:
+    columns = get_columns(conn, table_name)
 
     if column_name not in columns:
-
         conn.execute(
-            f"""
-            ALTER TABLE {table_name}
-            ADD COLUMN {column_name} {column_type}
-            """
+            f'ALTER TABLE "{table_name}" '
+            f'ADD COLUMN "{column_name}" {column_definition}'
         )
 
 
 # ============================================================
-# INITIALIZATION / MIGRATION
+# INICIALIZACIÓN / MIGRACIÓN
 # ============================================================
 
-def initialize_database():
+def initialize_database() -> None:
     """
-    Create and migrate the database.
+    Crea la base de datos y aplica migraciones aditivas.
 
-    Migration is additive:
-    existing information is preserved.
+    Nunca elimina columnas ni tablas existentes.
     """
+    Path(DATABASE_PATH).parent.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
     conn = get_connection()
 
     try:
-
-        cursor = conn.cursor()
-
         # ----------------------------------------------------
-        # Schema metadata
+        # META
         # ----------------------------------------------------
 
-        cursor.execute(
+        conn.execute(
             """
             CREATE TABLE IF NOT EXISTS schema_meta (
                 key TEXT PRIMARY KEY,
@@ -245,218 +261,154 @@ def initialize_database():
         )
 
         # ----------------------------------------------------
-        # Original trade_events table
+        # TRADE EVENTS
         # ----------------------------------------------------
 
-        cursor.execute(
+        conn.execute(
             """
             CREATE TABLE IF NOT EXISTS trade_events (
-
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-
                 timestamp TEXT NOT NULL,
-
-                symbol TEXT NOT NULL,
-
+                symbol TEXT,
                 signal TEXT,
-
                 entry_price REAL,
-
                 stop_price REAL,
-
                 position_size REAL,
-
                 status TEXT,
-
                 profit_loss REAL,
-
                 order_id TEXT,
-
                 client_order_id TEXT
             )
             """
         )
 
-        # ----------------------------------------------------
-        # Upgrade legacy trade_events
-        # ----------------------------------------------------
+        # V5 columns
+        trade_columns = [
+            ("strategy_version", "TEXT"),
+            ("reason", "TEXT"),
+            ("event_type", "TEXT"),
+            ("event_key", "TEXT"),
+            ("entry_timestamp", "TEXT"),
+            ("exit_timestamp", "TEXT"),
+            ("exit_price", "REAL"),
+            ("quantity", "REAL"),
+            ("realized_pl", "REAL"),
+            ("realized_pl_pct", "REAL"),
+            ("unrealized_pl", "REAL"),
+            ("unrealized_pl_pct", "REAL"),
+            ("peak_price", "REAL"),
+            ("original_stop", "REAL"),
+            ("current_stop", "REAL"),
+            ("state", "TEXT"),
+            ("managed_by", "TEXT"),
+            ("alpaca_order_id", "TEXT"),
+            ("alpaca_client_order_id", "TEXT"),
+            ("metadata", "TEXT"),
+            ("last_update", "TEXT"),
+        ]
 
-        legacy_columns = {
-
-            "strategy_version": "TEXT",
-            "reason": "TEXT",
-
-            "event_type": "TEXT",
-            "event_key": "TEXT",
-
-            "entry_timestamp": "TEXT",
-            "exit_timestamp": "TEXT",
-
-            "exit_price": "REAL",
-
-            "quantity": "REAL",
-
-            "realized_pl": "REAL",
-            "realized_pl_pct": "REAL",
-
-            "unrealized_pl": "REAL",
-            "unrealized_pl_pct": "REAL",
-
-            "peak_price": "REAL",
-
-            "original_stop": "REAL",
-            "current_stop": "REAL",
-
-            "state": "TEXT",
-
-            "managed_by": "TEXT",
-
-            "alpaca_order_id": "TEXT",
-            "alpaca_client_order_id": "TEXT",
-
-            "metadata": "TEXT",
-
-            "last_update": "TEXT"
-        }
-
-        for column, column_type in legacy_columns.items():
-
+        for column, definition in trade_columns:
             add_column_if_missing(
                 conn,
                 "trade_events",
                 column,
-                column_type
+                definition,
             )
 
         # ----------------------------------------------------
-        # Position state
+        # POSITION STATE
         # ----------------------------------------------------
 
-        cursor.execute(
+        conn.execute(
             """
             CREATE TABLE IF NOT EXISTS position_state (
-
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-
                 symbol TEXT NOT NULL UNIQUE,
-
-                quantity REAL DEFAULT 0,
+                quantity REAL NOT NULL DEFAULT 0,
 
                 entry_price REAL,
-
                 current_price REAL,
-
                 market_value REAL,
 
                 original_stop REAL,
-
                 current_stop REAL,
-
                 peak_price REAL,
 
                 unrealized_pl REAL,
-
                 unrealized_pl_pct REAL,
-
-                realized_pl REAL DEFAULT 0,
-
+                realized_pl REAL,
                 realized_pl_pct REAL,
 
-                state TEXT DEFAULT 'OPEN',
-
-                entry_order_id TEXT,
-
-                protective_order_id TEXT,
-
-                strategy_version TEXT,
-
-                managed_by TEXT,
-
+                state TEXT NOT NULL DEFAULT 'OPEN',
                 entry_timestamp TEXT,
-
-                last_seen_alpaca TEXT,
-
                 last_update TEXT,
 
-                metadata TEXT,
+                alpaca_order_id TEXT,
+                alpaca_client_order_id TEXT,
 
-                created_at TEXT NOT NULL
+                strategy_version TEXT,
+                managed_by TEXT,
+
+                metadata TEXT
             )
             """
         )
 
         # ----------------------------------------------------
-        # Order state
+        # ORDER STATE
         # ----------------------------------------------------
 
-        cursor.execute(
+        conn.execute(
             """
             CREATE TABLE IF NOT EXISTS order_state (
-
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
 
                 order_id TEXT NOT NULL UNIQUE,
-
                 client_order_id TEXT,
 
-                symbol TEXT NOT NULL,
-
+                symbol TEXT,
                 side TEXT,
-
                 order_type TEXT,
-
                 order_class TEXT,
-
                 time_in_force TEXT,
 
                 quantity REAL,
-
-                filled_quantity REAL DEFAULT 0,
-
-                limit_price REAL,
-
-                stop_price REAL,
+                filled_quantity REAL,
+                filled_avg_price REAL,
 
                 status TEXT,
-
                 submitted_at TEXT,
-
                 filled_at TEXT,
-
                 canceled_at TEXT,
 
-                replaced_by_order_id TEXT,
+                stop_price REAL,
+                limit_price REAL,
 
                 strategy_version TEXT,
-
-                last_update TEXT,
+                purpose TEXT,
 
                 metadata TEXT,
-
-                created_at TEXT NOT NULL
+                last_update TEXT
             )
             """
         )
 
         # ----------------------------------------------------
-        # System events
+        # SYSTEM EVENTS
         # ----------------------------------------------------
 
-        cursor.execute(
+        conn.execute(
             """
             CREATE TABLE IF NOT EXISTS system_events (
-
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
 
                 timestamp TEXT NOT NULL,
-
+                level TEXT NOT NULL,
                 event_type TEXT NOT NULL,
-
-                severity TEXT DEFAULT 'INFO',
-
-                symbol TEXT,
-
                 message TEXT,
+
+                component TEXT,
+                event_key TEXT,
 
                 metadata TEXT
             )
@@ -464,63 +416,52 @@ def initialize_database():
         )
 
         # ----------------------------------------------------
-        # Audit log
+        # AUDIT LOG
         # ----------------------------------------------------
 
-        cursor.execute(
+        conn.execute(
             """
             CREATE TABLE IF NOT EXISTS audit_log (
-
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
 
                 timestamp TEXT NOT NULL,
-
-                entity_type TEXT NOT NULL,
-
-                entity_id TEXT,
-
                 action TEXT NOT NULL,
+                component TEXT,
+
+                symbol TEXT,
+                order_id TEXT,
 
                 old_state TEXT,
-
                 new_state TEXT,
 
                 reason TEXT,
-
                 metadata TEXT
             )
             """
         )
 
         # ----------------------------------------------------
-        # Portfolio snapshots
+        # PORTFOLIO SNAPSHOTS
         # ----------------------------------------------------
 
-        cursor.execute(
+        conn.execute(
             """
             CREATE TABLE IF NOT EXISTS portfolio_snapshots (
-
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
 
                 timestamp TEXT NOT NULL,
 
                 equity REAL,
-
                 cash REAL,
-
                 buying_power REAL,
 
                 market_value REAL,
-
                 total_exposure REAL,
 
                 portfolio_risk REAL,
-
-                daily_pl REAL,
+                daily_profit_loss REAL,
 
                 open_positions INTEGER,
-
-                open_orders INTEGER,
 
                 metadata TEXT
             )
@@ -528,211 +469,129 @@ def initialize_database():
         )
 
         # ----------------------------------------------------
-        # Reconciliation
+        # RECONCILIATION
         # ----------------------------------------------------
 
-        cursor.execute(
+        conn.execute(
             """
             CREATE TABLE IF NOT EXISTS reconciliation_log (
-
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
 
                 timestamp TEXT NOT NULL,
 
                 symbol TEXT,
+                source TEXT,
 
-                entity_type TEXT NOT NULL,
+                issue_type TEXT NOT NULL,
+                severity TEXT NOT NULL,
 
-                local_state TEXT,
+                database_quantity REAL,
+                alpaca_quantity REAL,
 
+                database_state TEXT,
                 alpaca_state TEXT,
 
-                status TEXT NOT NULL,
+                resolved INTEGER NOT NULL DEFAULT 0,
 
-                discrepancy TEXT,
-
-                resolution TEXT,
-
-                metadata TEXT
+                details TEXT
             )
             """
         )
 
         # ----------------------------------------------------
-        # Indexes
+        # INDEXES
         # ----------------------------------------------------
 
         indexes = [
-
             """
-            CREATE INDEX IF NOT EXISTS
-            idx_trade_symbol
-            ON trade_events(symbol)
-            """,
-
-            """
-            CREATE INDEX IF NOT EXISTS
-            idx_trade_status
-            ON trade_events(status)
-            """,
-
-            """
-            CREATE INDEX IF NOT EXISTS
-            idx_trade_state
-            ON trade_events(state)
-            """,
-
-            """
-            CREATE INDEX IF NOT EXISTS
-            idx_trade_timestamp
+            CREATE INDEX IF NOT EXISTS idx_trade_events_timestamp
             ON trade_events(timestamp)
             """,
-
             """
-            CREATE INDEX IF NOT EXISTS
-            idx_trade_order
-            ON trade_events(order_id)
+            CREATE INDEX IF NOT EXISTS idx_trade_events_symbol
+            ON trade_events(symbol)
             """,
-
             """
-            CREATE INDEX IF NOT EXISTS
-            idx_trade_event_key
+            CREATE INDEX IF NOT EXISTS idx_trade_events_event_type
+            ON trade_events(event_type)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_trade_events_event_key
             ON trade_events(event_key)
             """,
-
             """
-            CREATE INDEX IF NOT EXISTS
-            idx_orders_symbol
+            CREATE INDEX IF NOT EXISTS idx_trade_events_order_id
+            ON trade_events(order_id)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_position_state_state
+            ON position_state(state)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_order_state_symbol
             ON order_state(symbol)
             """,
-
             """
-            CREATE INDEX IF NOT EXISTS
-            idx_orders_status
+            CREATE INDEX IF NOT EXISTS idx_order_state_status
             ON order_state(status)
             """,
-
             """
-            CREATE INDEX IF NOT EXISTS
-            idx_system_timestamp
+            CREATE INDEX IF NOT EXISTS idx_system_events_timestamp
             ON system_events(timestamp)
             """,
-
             """
-            CREATE INDEX IF NOT EXISTS
-            idx_audit_timestamp
+            CREATE INDEX IF NOT EXISTS idx_system_events_level
+            ON system_events(level)
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS idx_audit_timestamp
             ON audit_log(timestamp)
             """,
-
             """
-            CREATE INDEX IF NOT EXISTS
-            idx_reconciliation_timestamp
-            ON reconciliation_log(timestamp)
-            """
+            CREATE INDEX IF NOT EXISTS idx_reconciliation_symbol
+            ON reconciliation_log(symbol)
+            """,
         ]
 
-        for index_sql in indexes:
-            cursor.execute(index_sql)
+        for sql in indexes:
+            conn.execute(sql)
 
         # ----------------------------------------------------
-        # Schema metadata
+        # META
         # ----------------------------------------------------
 
-        cursor.execute(
+        conn.execute(
             """
-            INSERT INTO schema_meta (
-                key,
-                value,
-                updated_at
-            )
-
-            VALUES (
-                'schema_version',
-                ?,
-                ?
-            )
-
+            INSERT INTO schema_meta(key, value, updated_at)
+            VALUES ('schema_version', ?, ?)
             ON CONFLICT(key)
             DO UPDATE SET
                 value=excluded.value,
                 updated_at=excluded.updated_at
             """,
-            (
-                str(SCHEMA_VERSION),
-                now_iso()
-            )
+            (str(SCHEMA_VERSION), now_iso()),
         )
 
-        cursor.execute(
+        conn.execute(
             """
-            INSERT INTO schema_meta (
-                key,
-                value,
-                updated_at
-            )
-
-            VALUES (
-                'bot_version',
-                ?,
-                ?
-            )
-
+            INSERT INTO schema_meta(key, value, updated_at)
+            VALUES ('bot_version', ?, ?)
             ON CONFLICT(key)
             DO UPDATE SET
                 value=excluded.value,
                 updated_at=excluded.updated_at
             """,
-            (
-                BOT_VERSION,
-                now_iso()
-            )
+            (BOT_VERSION, now_iso()),
         )
 
         conn.commit()
 
-    except Exception:
-
-        conn.rollback()
-        raise
-
     finally:
-
         conn.close()
 
 
 # ============================================================
-# EVENT KEY
-# ============================================================
-
-def make_event_key(
-    event_type: str,
-    symbol: Optional[str] = None,
-    order_id: Optional[str] = None,
-    extra: Optional[str] = None
-) -> str:
-    """
-    Create deterministic event identifier.
-
-    Prevents accidental duplicate records.
-    """
-
-    raw = "|".join(
-        str(x or "")
-        for x in [
-            event_type,
-            symbol,
-            order_id,
-            extra
-        ]
-    )
-
-    return hashlib.sha256(
-        raw.encode("utf-8")
-    ).hexdigest()
-
-
-# ============================================================
-# TRADE EVENT
+# TRADE EVENTS
 # ============================================================
 
 def log_event(
@@ -745,176 +604,121 @@ def log_event(
     profit_loss: Optional[float] = None,
     order_id: Optional[str] = None,
     client_order_id: Optional[str] = None,
-
     strategy_version: Optional[str] = None,
     reason: Optional[str] = None,
-
+    event_type: Optional[str] = None,
+    event_key: Optional[str] = None,
     entry_timestamp: Optional[str] = None,
     exit_timestamp: Optional[str] = None,
-
     exit_price: Optional[float] = None,
     quantity: Optional[float] = None,
-
     realized_pl: Optional[float] = None,
     realized_pl_pct: Optional[float] = None,
-
+    unrealized_pl: Optional[float] = None,
+    unrealized_pl_pct: Optional[float] = None,
     peak_price: Optional[float] = None,
-
-    current_stop: Optional[float] = None,
     original_stop: Optional[float] = None,
-
+    current_stop: Optional[float] = None,
     state: Optional[str] = None,
-
     managed_by: Optional[str] = None,
-
-    alpaca_order_id: Optional[str] = None,
-    alpaca_client_order_id: Optional[str] = None,
-
-    event_type: Optional[str] = None,
-
     metadata: Optional[Dict[str, Any]] = None,
-
-    event_key: Optional[str] = None
+    timestamp: Optional[str] = None,
 ) -> int:
     """
-    Insert a trade event.
+    Registra evento de trading.
 
-    Compatible with previous versions.
-
-    Returns:
-        Existing or newly created event ID.
+    Devuelve ID del evento.
+    Si event_key ya existe, devuelve el evento existente.
     """
 
-    timestamp = now_iso()
+    symbol = _normalize_symbol(symbol)
+    timestamp = timestamp or now_iso()
 
-    if entry_timestamp is None and entry_price is not None:
-        entry_timestamp = timestamp
-
-    if quantity is None:
-        quantity = position_size
-
-    if realized_pl is None:
-        realized_pl = profit_loss
-
-    if state is None:
-        state = status
-
-    if event_type is None:
-        event_type = status or signal or "EVENT"
-
-    actual_order_id = (
-        alpaca_order_id
-        or order_id
-    )
-
-    actual_client_order_id = (
-        alpaca_client_order_id
-        or client_order_id
+    event_type = (
+        str(event_type).strip().upper()
+        if event_type
+        else None
     )
 
     if event_key is None:
-
-        event_key = make_event_key(
-            event_type,
-            symbol,
-            actual_order_id,
-            client_order_id
+        event_key = _event_key(
+            symbol=symbol,
+            event_type=event_type or signal or "EVENT",
+            order_id=order_id,
+            timestamp=timestamp,
+            extra={
+                "entry_price": entry_price,
+                "exit_price": exit_price,
+                "quantity": quantity or position_size,
+                "status": status,
+            },
         )
 
     conn = get_connection()
 
     try:
-
-        # ----------------------------------------------------
-        # Idempotency check
-        # ----------------------------------------------------
-
         existing = conn.execute(
             """
             SELECT id
             FROM trade_events
-            WHERE event_key = ?
+            WHERE event_key=?
             LIMIT 1
             """,
-            (event_key,)
+            (event_key,),
         ).fetchone()
 
         if existing:
-
             return int(existing["id"])
 
-        cursor = conn.cursor()
-
-        cursor.execute(
+        cursor = conn.execute(
             """
             INSERT INTO trade_events (
-
                 timestamp,
                 symbol,
                 signal,
-
                 entry_price,
                 stop_price,
                 position_size,
-
                 status,
                 profit_loss,
-
                 order_id,
                 client_order_id,
 
                 strategy_version,
                 reason,
-
                 event_type,
                 event_key,
 
                 entry_timestamp,
                 exit_timestamp,
-
                 exit_price,
                 quantity,
 
                 realized_pl,
                 realized_pl_pct,
-
                 unrealized_pl,
                 unrealized_pl_pct,
 
                 peak_price,
-
                 original_stop,
                 current_stop,
 
                 state,
-
                 managed_by,
 
                 alpaca_order_id,
                 alpaca_client_order_id,
 
                 metadata,
-
                 last_update
             )
-
             VALUES (
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?, ?, ?,
+                ?, ?, ?, ?,
+                ?, ?, ?, ?,
                 ?, ?, ?,
-                ?, ?, ?,
                 ?, ?,
-                ?, ?,
-                ?, ?,
-                ?, ?,
-                ?, ?,
-                ?, ?,
-                ?, ?,
-                ?, ?,
-                ?, ?,
-                ?,
-                ?, ?,
-                ?,
-                ?,
-                ?,
                 ?, ?,
                 ?, ?
             )
@@ -923,183 +727,129 @@ def log_event(
                 timestamp,
                 symbol,
                 signal,
-
-                entry_price,
-                stop_price,
-                position_size,
-
+                _safe_float(entry_price),
+                _safe_float(stop_price),
+                _safe_float(position_size),
                 status,
-                profit_loss,
-
+                _safe_float(profit_loss),
                 order_id,
                 client_order_id,
 
                 strategy_version,
                 reason,
-
                 event_type,
                 event_key,
 
                 entry_timestamp,
                 exit_timestamp,
+                _safe_float(exit_price),
+                _safe_float(quantity or position_size),
 
-                exit_price,
-                quantity,
+                _safe_float(realized_pl),
+                _safe_float(realized_pl_pct),
+                _safe_float(unrealized_pl),
+                _safe_float(unrealized_pl_pct),
 
-                realized_pl,
-                realized_pl_pct,
-
-                None,
-                None,
-
-                peak_price,
-
-                original_stop,
-                current_stop,
+                _safe_float(peak_price),
+                _safe_float(original_stop),
+                _safe_float(current_stop),
 
                 state,
-
                 managed_by,
 
-                actual_order_id,
-                actual_client_order_id,
+                order_id,
+                client_order_id,
 
-                json_dumps(metadata),
-
-                timestamp
-            )
+                _json_dumps(metadata),
+                now_iso(),
+            ),
         )
 
         conn.commit()
 
         return int(cursor.lastrowid)
 
-    except Exception:
-
-        conn.rollback()
-        raise
-
     finally:
-
         conn.close()
 
 
-# ============================================================
-# UPDATE EVENT
-# ============================================================
-
 def update_event(
     event_id: int,
-    **fields
+    **fields: Any,
 ) -> bool:
     """
-    Update an existing event.
-
-    Unknown fields are ignored.
+    Actualiza únicamente columnas permitidas.
     """
 
     allowed = {
-
-        "symbol",
         "signal",
-
         "entry_price",
         "stop_price",
         "position_size",
-
         "status",
         "profit_loss",
-
         "order_id",
         "client_order_id",
-
         "strategy_version",
         "reason",
-
         "event_type",
-        "event_key",
-
         "entry_timestamp",
         "exit_timestamp",
-
         "exit_price",
         "quantity",
-
         "realized_pl",
         "realized_pl_pct",
-
         "unrealized_pl",
         "unrealized_pl_pct",
-
         "peak_price",
-
         "original_stop",
         "current_stop",
-
         "state",
-
         "managed_by",
-
         "alpaca_order_id",
         "alpaca_client_order_id",
-
-        "metadata"
+        "metadata",
     }
 
-    updates = {}
+    updates = []
+
+    values: List[Any] = []
 
     for key, value in fields.items():
-
         if key not in allowed:
             continue
 
-        if key == "metadata":
-            value = json_dumps(value)
+        updates.append(f'"{key}"=?')
 
-        updates[key] = value
+        if key == "metadata":
+            value = _json_dumps(value)
+
+        values.append(value)
 
     if not updates:
         return False
 
-    updates["last_update"] = now_iso()
-
-    set_clause = ", ".join(
-        f"{key} = ?"
-        for key in updates
-    )
-
-    values = list(
-        updates.values()
-    )
-
+    updates.append('"last_update"=?')
+    values.append(now_iso())
     values.append(event_id)
 
     conn = get_connection()
 
     try:
-
-        cursor = conn.cursor()
-
-        cursor.execute(
+        cursor = conn.execute(
             f"""
             UPDATE trade_events
-            SET {set_clause}
-            WHERE id = ?
+            SET {", ".join(updates)}
+            WHERE id=?
             """,
-            values
+            values,
         )
 
         conn.commit()
 
         return cursor.rowcount > 0
 
-    except Exception:
-
-        conn.rollback()
-        raise
-
     finally:
-
         conn.close()
 
 
@@ -1109,277 +859,211 @@ def update_event(
 
 def upsert_order(
     order_id: str,
-    symbol: str,
     client_order_id: Optional[str] = None,
+    symbol: Optional[str] = None,
     side: Optional[str] = None,
     order_type: Optional[str] = None,
     order_class: Optional[str] = None,
     time_in_force: Optional[str] = None,
     quantity: Optional[float] = None,
     filled_quantity: Optional[float] = None,
-    limit_price: Optional[float] = None,
-    stop_price: Optional[float] = None,
+    filled_avg_price: Optional[float] = None,
     status: Optional[str] = None,
     submitted_at: Optional[str] = None,
     filled_at: Optional[str] = None,
     canceled_at: Optional[str] = None,
-    replaced_by_order_id: Optional[str] = None,
+    stop_price: Optional[float] = None,
+    limit_price: Optional[float] = None,
     strategy_version: Optional[str] = None,
-    metadata: Optional[Dict[str, Any]] = None
-) -> bool:
+    purpose: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> None:
     """
-    Insert or update an Alpaca order.
+    Inserta o actualiza estado de una orden Alpaca.
     """
 
     if not order_id:
-        return False
-
-    timestamp = now_iso()
+        return
 
     conn = get_connection()
 
     try:
-
         conn.execute(
             """
             INSERT INTO order_state (
-
                 order_id,
                 client_order_id,
-
                 symbol,
                 side,
-
                 order_type,
                 order_class,
                 time_in_force,
 
                 quantity,
                 filled_quantity,
-
-                limit_price,
-                stop_price,
+                filled_avg_price,
 
                 status,
-
                 submitted_at,
                 filled_at,
                 canceled_at,
 
-                replaced_by_order_id,
+                stop_price,
+                limit_price,
 
                 strategy_version,
-
-                last_update,
+                purpose,
 
                 metadata,
-
-                created_at
+                last_update
             )
-
             VALUES (
-                ?, ?,
-                ?, ?,
+                ?, ?, ?, ?, ?, ?, ?,
                 ?, ?, ?,
+                ?, ?, ?, ?,
                 ?, ?,
                 ?, ?,
-                ?,
-                ?, ?, ?,
-                ?,
-                ?,
-                ?,
-                ?,
-                ?
+                ?, ?
             )
-
             ON CONFLICT(order_id)
             DO UPDATE SET
-
-                client_order_id =
-                    COALESCE(
-                        excluded.client_order_id,
-                        order_state.client_order_id
-                    ),
-
-                symbol =
+                client_order_id=COALESCE(
+                    excluded.client_order_id,
+                    order_state.client_order_id
+                ),
+                symbol=COALESCE(
                     excluded.symbol,
+                    order_state.symbol
+                ),
+                side=COALESCE(
+                    excluded.side,
+                    order_state.side
+                ),
+                order_type=COALESCE(
+                    excluded.order_type,
+                    order_state.order_type
+                ),
+                order_class=COALESCE(
+                    excluded.order_class,
+                    order_state.order_class
+                ),
+                time_in_force=COALESCE(
+                    excluded.time_in_force,
+                    order_state.time_in_force
+                ),
 
-                side =
-                    COALESCE(
-                        excluded.side,
-                        order_state.side
-                    ),
+                quantity=COALESCE(
+                    excluded.quantity,
+                    order_state.quantity
+                ),
+                filled_quantity=COALESCE(
+                    excluded.filled_quantity,
+                    order_state.filled_quantity
+                ),
+                filled_avg_price=COALESCE(
+                    excluded.filled_avg_price,
+                    order_state.filled_avg_price
+                ),
 
-                order_type =
-                    COALESCE(
-                        excluded.order_type,
-                        order_state.order_type
-                    ),
+                status=COALESCE(
+                    excluded.status,
+                    order_state.status
+                ),
+                submitted_at=COALESCE(
+                    excluded.submitted_at,
+                    order_state.submitted_at
+                ),
+                filled_at=COALESCE(
+                    excluded.filled_at,
+                    order_state.filled_at
+                ),
+                canceled_at=COALESCE(
+                    excluded.canceled_at,
+                    order_state.canceled_at
+                ),
 
-                order_class =
-                    COALESCE(
-                        excluded.order_class,
-                        order_state.order_class
-                    ),
+                stop_price=COALESCE(
+                    excluded.stop_price,
+                    order_state.stop_price
+                ),
+                limit_price=COALESCE(
+                    excluded.limit_price,
+                    order_state.limit_price
+                ),
 
-                time_in_force =
-                    COALESCE(
-                        excluded.time_in_force,
-                        order_state.time_in_force
-                    ),
+                strategy_version=COALESCE(
+                    excluded.strategy_version,
+                    order_state.strategy_version
+                ),
+                purpose=COALESCE(
+                    excluded.purpose,
+                    order_state.purpose
+                ),
 
-                quantity =
-                    COALESCE(
-                        excluded.quantity,
-                        order_state.quantity
-                    ),
+                metadata=COALESCE(
+                    excluded.metadata,
+                    order_state.metadata
+                ),
 
-                filled_quantity =
-                    COALESCE(
-                        excluded.filled_quantity,
-                        order_state.filled_quantity
-                    ),
-
-                limit_price =
-                    COALESCE(
-                        excluded.limit_price,
-                        order_state.limit_price
-                    ),
-
-                stop_price =
-                    COALESCE(
-                        excluded.stop_price,
-                        order_state.stop_price
-                    ),
-
-                status =
-                    COALESCE(
-                        excluded.status,
-                        order_state.status
-                    ),
-
-                submitted_at =
-                    COALESCE(
-                        excluded.submitted_at,
-                        order_state.submitted_at
-                    ),
-
-                filled_at =
-                    COALESCE(
-                        excluded.filled_at,
-                        order_state.filled_at
-                    ),
-
-                canceled_at =
-                    COALESCE(
-                        excluded.canceled_at,
-                        order_state.canceled_at
-                    ),
-
-                replaced_by_order_id =
-                    COALESCE(
-                        excluded.replaced_by_order_id,
-                        order_state.replaced_by_order_id
-                    ),
-
-                strategy_version =
-                    COALESCE(
-                        excluded.strategy_version,
-                        order_state.strategy_version
-                    ),
-
-                last_update =
-                    excluded.last_update,
-
-                metadata =
-                    COALESCE(
-                        excluded.metadata,
-                        order_state.metadata
-                    )
+                last_update=excluded.last_update
             """,
             (
-                order_id,
+                str(order_id),
                 client_order_id,
-
-                symbol,
+                _normalize_symbol(symbol),
                 side,
-
                 order_type,
                 order_class,
                 time_in_force,
 
-                quantity,
-                filled_quantity or 0,
-
-                limit_price,
-                stop_price,
+                _safe_float(quantity),
+                _safe_float(filled_quantity),
+                _safe_float(filled_avg_price),
 
                 status,
-
                 submitted_at,
                 filled_at,
                 canceled_at,
 
-                replaced_by_order_id,
+                _safe_float(stop_price),
+                _safe_float(limit_price),
 
                 strategy_version,
+                purpose,
 
-                timestamp,
-
-                json_dumps(metadata),
-
-                timestamp
-            )
+                _json_dumps(metadata),
+                now_iso(),
+            ),
         )
 
         conn.commit()
 
-        return True
-
-    except Exception:
-
-        conn.rollback()
-        raise
-
     finally:
-
         conn.close()
 
 
-def get_order(
-    order_id: str
-) -> Optional[Dict[str, Any]]:
-
-    if not order_id:
-        return None
-
+def get_order(order_id: str) -> Optional[Dict[str, Any]]:
     conn = get_connection()
 
     try:
-
         row = conn.execute(
             """
             SELECT *
             FROM order_state
-            WHERE order_id = ?
+            WHERE order_id=?
             LIMIT 1
             """,
-            (order_id,)
+            (str(order_id),),
         ).fetchone()
 
-        if not row:
-            return None
+        result = _row_to_dict(row)
 
-        result = dict(row)
-
-        result["metadata"] = json_loads(
-            result.get("metadata")
-        )
+        if result and result.get("metadata"):
+            result["metadata"] = _json_loads(result["metadata"])
 
         return result
 
     finally:
-
         conn.close()
 
 
@@ -1389,59 +1073,43 @@ def get_order(
 
 def upsert_position_state(
     symbol: str,
-
-    quantity: Optional[float] = None,
-
+    quantity: float,
     entry_price: Optional[float] = None,
-
     current_price: Optional[float] = None,
-
     market_value: Optional[float] = None,
-
     original_stop: Optional[float] = None,
-
     current_stop: Optional[float] = None,
-
     peak_price: Optional[float] = None,
-
     unrealized_pl: Optional[float] = None,
-
     unrealized_pl_pct: Optional[float] = None,
-
     realized_pl: Optional[float] = None,
-
     realized_pl_pct: Optional[float] = None,
-
     state: str = "OPEN",
-
-    entry_order_id: Optional[str] = None,
-
-    protective_order_id: Optional[str] = None,
-
-    strategy_version: Optional[str] = None,
-
-    managed_by: Optional[str] = None,
-
     entry_timestamp: Optional[str] = None,
-
-    metadata: Optional[Dict[str, Any]] = None
-) -> bool:
+    alpaca_order_id: Optional[str] = None,
+    alpaca_client_order_id: Optional[str] = None,
+    strategy_version: Optional[str] = None,
+    managed_by: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> None:
     """
-    Persistent state of an open position.
+    Inserta o actualiza el estado persistente de una posición.
+
+    peak_price nunca retrocede.
     """
 
-    timestamp = now_iso()
+    symbol = _normalize_symbol(symbol)
+
+    if not symbol:
+        return
 
     conn = get_connection()
 
     try:
-
         conn.execute(
             """
             INSERT INTO position_state (
-
                 symbol,
-
                 quantity,
 
                 entry_price,
@@ -1450,627 +1118,485 @@ def upsert_position_state(
 
                 original_stop,
                 current_stop,
-
                 peak_price,
 
                 unrealized_pl,
                 unrealized_pl_pct,
-
                 realized_pl,
                 realized_pl_pct,
 
                 state,
+                entry_timestamp,
+                last_update,
 
-                entry_order_id,
-                protective_order_id,
+                alpaca_order_id,
+                alpaca_client_order_id,
 
                 strategy_version,
                 managed_by,
 
-                entry_timestamp,
-
-                last_seen_alpaca,
-                last_update,
-
-                metadata,
-
-                created_at
+                metadata
             )
-
             VALUES (
-                ?,
-                ?,
+                ?, ?,
+                ?, ?, ?,
+                ?, ?, ?,
+                ?, ?, ?, ?,
                 ?, ?, ?,
                 ?, ?,
-                ?,
                 ?, ?,
-                ?, ?,
-                ?,
-                ?, ?,
-                ?, ?,
-                ?,
-                ?,
-                ?,
-                ?,
-                ?,
-                ?
+                ?, ?
             )
-
             ON CONFLICT(symbol)
             DO UPDATE SET
 
-                quantity =
-                    COALESCE(
-                        excluded.quantity,
-                        position_state.quantity
-                    ),
+                quantity=excluded.quantity,
 
-                entry_price =
-                    COALESCE(
-                        excluded.entry_price,
-                        position_state.entry_price
-                    ),
+                entry_price=COALESCE(
+                    excluded.entry_price,
+                    position_state.entry_price
+                ),
 
-                current_price =
-                    COALESCE(
-                        excluded.current_price,
-                        position_state.current_price
-                    ),
+                current_price=COALESCE(
+                    excluded.current_price,
+                    position_state.current_price
+                ),
 
-                market_value =
-                    COALESCE(
-                        excluded.market_value,
-                        position_state.market_value
-                    ),
+                market_value=COALESCE(
+                    excluded.market_value,
+                    position_state.market_value
+                ),
 
-                original_stop =
-                    COALESCE(
-                        excluded.original_stop,
-                        position_state.original_stop
-                    ),
+                original_stop=COALESCE(
+                    excluded.original_stop,
+                    position_state.original_stop
+                ),
 
-                current_stop =
-                    COALESCE(
-                        excluded.current_stop,
-                        position_state.current_stop
-                    ),
+                current_stop=COALESCE(
+                    excluded.current_stop,
+                    position_state.current_stop
+                ),
 
-                peak_price =
-                    CASE
+                peak_price=CASE
+                    WHEN excluded.peak_price IS NULL
+                        THEN position_state.peak_price
+                    WHEN position_state.peak_price IS NULL
+                        THEN excluded.peak_price
+                    WHEN excluded.peak_price >
+                         position_state.peak_price
+                        THEN excluded.peak_price
+                    ELSE position_state.peak_price
+                END,
 
-                        WHEN excluded.peak_price IS NULL
-                            THEN position_state.peak_price
+                unrealized_pl=COALESCE(
+                    excluded.unrealized_pl,
+                    position_state.unrealized_pl
+                ),
 
-                        WHEN position_state.peak_price IS NULL
-                            THEN excluded.peak_price
+                unrealized_pl_pct=COALESCE(
+                    excluded.unrealized_pl_pct,
+                    position_state.unrealized_pl_pct
+                ),
 
-                        WHEN excluded.peak_price >
-                             position_state.peak_price
-                            THEN excluded.peak_price
+                realized_pl=COALESCE(
+                    excluded.realized_pl,
+                    position_state.realized_pl
+                ),
 
-                        ELSE position_state.peak_price
+                realized_pl_pct=COALESCE(
+                    excluded.realized_pl_pct,
+                    position_state.realized_pl_pct
+                ),
 
-                    END,
+                state=COALESCE(
+                    excluded.state,
+                    position_state.state
+                ),
 
-                unrealized_pl =
-                    COALESCE(
-                        excluded.unrealized_pl,
-                        position_state.unrealized_pl
-                    ),
+                entry_timestamp=COALESCE(
+                    excluded.entry_timestamp,
+                    position_state.entry_timestamp
+                ),
 
-                unrealized_pl_pct =
-                    COALESCE(
-                        excluded.unrealized_pl_pct,
-                        position_state.unrealized_pl_pct
-                    ),
+                alpaca_order_id=COALESCE(
+                    excluded.alpaca_order_id,
+                    position_state.alpaca_order_id
+                ),
 
-                realized_pl =
-                    COALESCE(
-                        excluded.realized_pl,
-                        position_state.realized_pl
-                    ),
+                alpaca_client_order_id=COALESCE(
+                    excluded.alpaca_client_order_id,
+                    position_state.alpaca_client_order_id
+                ),
 
-                realized_pl_pct =
-                    COALESCE(
-                        excluded.realized_pl_pct,
-                        position_state.realized_pl_pct
-                    ),
+                strategy_version=COALESCE(
+                    excluded.strategy_version,
+                    position_state.strategy_version
+                ),
 
-                state =
-                    COALESCE(
-                        excluded.state,
-                        position_state.state
-                    ),
+                managed_by=COALESCE(
+                    excluded.managed_by,
+                    position_state.managed_by
+                ),
 
-                entry_order_id =
-                    COALESCE(
-                        excluded.entry_order_id,
-                        position_state.entry_order_id
-                    ),
+                metadata=COALESCE(
+                    excluded.metadata,
+                    position_state.metadata
+                ),
 
-                protective_order_id =
-                    COALESCE(
-                        excluded.protective_order_id,
-                        position_state.protective_order_id
-                    ),
-
-                strategy_version =
-                    COALESCE(
-                        excluded.strategy_version,
-                        position_state.strategy_version
-                    ),
-
-                managed_by =
-                    COALESCE(
-                        excluded.managed_by,
-                        position_state.managed_by
-                    ),
-
-                entry_timestamp =
-                    COALESCE(
-                        excluded.entry_timestamp,
-                        position_state.entry_timestamp
-                    ),
-
-                last_seen_alpaca =
-                    excluded.last_seen_alpaca,
-
-                last_update =
-                    excluded.last_update,
-
-                metadata =
-                    COALESCE(
-                        excluded.metadata,
-                        position_state.metadata
-                    )
+                last_update=excluded.last_update
             """,
             (
                 symbol,
+                _safe_float(quantity, 0.0),
 
-                quantity,
+                _safe_float(entry_price),
+                _safe_float(current_price),
+                _safe_float(market_value),
 
-                entry_price,
-                current_price,
-                market_value,
+                _safe_float(original_stop),
+                _safe_float(current_stop),
+                _safe_float(peak_price),
 
-                original_stop,
-                current_stop,
-
-                peak_price,
-
-                unrealized_pl,
-                unrealized_pl_pct,
-
-                realized_pl,
-                realized_pl_pct,
+                _safe_float(unrealized_pl),
+                _safe_float(unrealized_pl_pct),
+                _safe_float(realized_pl),
+                _safe_float(realized_pl_pct),
 
                 state,
+                entry_timestamp,
+                now_iso(),
 
-                entry_order_id,
-                protective_order_id,
+                alpaca_order_id,
+                alpaca_client_order_id,
 
                 strategy_version,
                 managed_by,
 
-                entry_timestamp,
-
-                timestamp,
-                timestamp,
-
-                json_dumps(metadata),
-
-                timestamp
-            )
+                _json_dumps(metadata),
+            ),
         )
 
         conn.commit()
 
-        return True
-
-    except Exception:
-
-        conn.rollback()
-        raise
-
     finally:
-
         conn.close()
 
 
 def get_position_state(
-    symbol: str
+    symbol: str,
 ) -> Optional[Dict[str, Any]]:
+    symbol = _normalize_symbol(symbol)
 
     conn = get_connection()
 
     try:
-
         row = conn.execute(
             """
             SELECT *
             FROM position_state
-            WHERE symbol = ?
+            WHERE symbol=?
             LIMIT 1
             """,
-            (symbol,)
+            (symbol,),
         ).fetchone()
 
-        if not row:
-            return None
+        result = _row_to_dict(row)
 
-        result = dict(row)
-
-        result["metadata"] = json_loads(
-            result.get("metadata")
-        )
+        if result and result.get("metadata"):
+            result["metadata"] = _json_loads(result["metadata"])
 
         return result
 
     finally:
-
         conn.close()
 
 
-def get_all_open_position_states()
--> List[Dict[str, Any]]:
+def get_all_open_position_states() -> List[Dict[str, Any]]:
+    """
+    Devuelve posiciones que la DB considera abiertas.
+    """
 
     conn = get_connection()
 
     try:
-
         rows = conn.execute(
             """
             SELECT *
             FROM position_state
-            WHERE state = 'OPEN'
+            WHERE quantity > 0
+              AND UPPER(state) NOT IN (
+                  'CLOSED',
+                  'STOPPED',
+                  'EXIT_FILLED'
+              )
             ORDER BY symbol
             """
         ).fetchall()
 
-        results = []
+        result = _rows_to_dicts(rows)
 
-        for row in rows:
+        for item in result:
+            if item.get("metadata"):
+                item["metadata"] = _json_loads(item["metadata"])
 
-            result = dict(row)
-
-            result["metadata"] = json_loads(
-                result.get("metadata")
-            )
-
-            results.append(result)
-
-        return results
+        return result
 
     finally:
-
         conn.close()
 
 
 def close_position_state(
     symbol: str,
-    exit_price: Optional[float] = None,
     realized_pl: Optional[float] = None,
     realized_pl_pct: Optional[float] = None,
-    state: str = "CLOSED"
+    exit_price: Optional[float] = None,
+    state: str = "CLOSED",
 ) -> bool:
-
-    timestamp = now_iso()
+    symbol = _normalize_symbol(symbol)
 
     conn = get_connection()
 
     try:
-
-        cursor = conn.cursor()
-
-        cursor.execute(
+        cursor = conn.execute(
             """
             UPDATE position_state
-
             SET
-
-                current_price =
-                    COALESCE(
-                        ?,
-                        current_price
-                    ),
-
-                unrealized_pl = NULL,
-
-                unrealized_pl_pct = NULL,
-
-                realized_pl =
-                    COALESCE(
-                        ?,
-                        realized_pl
-                    ),
-
-                realized_pl_pct =
-                    COALESCE(
-                        ?,
-                        realized_pl_pct
-                    ),
-
-                state = ?,
-
-                last_update = ?
-
-            WHERE symbol = ?
+                quantity=0,
+                current_price=COALESCE(?, current_price),
+                realized_pl=COALESCE(?, realized_pl),
+                realized_pl_pct=COALESCE(
+                    ?,
+                    realized_pl_pct
+                ),
+                state=?,
+                last_update=?
+            WHERE symbol=?
             """,
             (
-                exit_price,
-                realized_pl,
-                realized_pl_pct,
+                _safe_float(exit_price),
+                _safe_float(realized_pl),
+                _safe_float(realized_pl_pct),
                 state,
-                timestamp,
-                symbol
-            )
+                now_iso(),
+                symbol,
+            ),
         )
 
         conn.commit()
 
         return cursor.rowcount > 0
 
-    except Exception:
-
-        conn.rollback()
-        raise
-
     finally:
-
         conn.close()
 
 
 # ============================================================
-# TRADE LOOKUPS
+# EVENT QUERIES
 # ============================================================
 
 def get_event_by_order_id(
-    order_id: str
+    order_id: str,
 ) -> Optional[Dict[str, Any]]:
-
-    if not order_id:
-        return None
-
     conn = get_connection()
 
     try:
-
         row = conn.execute(
             """
             SELECT *
             FROM trade_events
-
-            WHERE order_id = ?
-               OR alpaca_order_id = ?
-
+            WHERE order_id=?
+               OR alpaca_order_id=?
             ORDER BY id DESC
-
             LIMIT 1
             """,
-            (
-                order_id,
-                order_id
-            )
+            (str(order_id), str(order_id)),
         ).fetchone()
 
-        return dict(row) if row else None
+        result = _row_to_dict(row)
+
+        if result and result.get("metadata"):
+            result["metadata"] = _json_loads(result["metadata"])
+
+        return result
 
     finally:
-
         conn.close()
 
 
 def get_open_position_event(
-    symbol: str
+    symbol: str,
 ) -> Optional[Dict[str, Any]]:
+    """
+    Busca primero el estado persistente de posición.
+
+    Si no existe, hace fallback al historial de eventos.
+    """
+
+    symbol = _normalize_symbol(symbol)
+
+    state = get_position_state(symbol)
+
+    if state:
+        quantity = _safe_float(state.get("quantity"), 0.0)
+
+        if quantity and quantity > 0:
+            return state
 
     conn = get_connection()
 
     try:
-
         row = conn.execute(
             """
             SELECT *
             FROM trade_events
-
-            WHERE symbol = ?
-
+            WHERE symbol=?
               AND (
-
-                    state IN (
-                        'OPEN',
-                        'POSITION_OPEN',
-                        'FILLED'
-                    )
-
-                    OR
-
-                    status IN (
-                        'OPEN',
-                        'POSITION_OPEN',
-                        'FILLED'
-                    )
-
+                  UPPER(COALESCE(state, '')) NOT IN (
+                      'CLOSED',
+                      'STOPPED',
+                      'EXIT_FILLED'
                   )
-
+              )
+              AND (
+                  UPPER(COALESCE(status, '')) IN (
+                      'FILLED',
+                      'POSITION_OPEN',
+                      'OPEN'
+                  )
+                  OR UPPER(COALESCE(event_type, '')) IN (
+                      'ENTRY',
+                      'ENTRY_SUBMITTED',
+                      'ENTRY_FILLED'
+                  )
+              )
             ORDER BY id DESC
-
             LIMIT 1
             """,
-            (symbol,)
+            (symbol,),
         ).fetchone()
 
-        return dict(row) if row else None
+        result = _row_to_dict(row)
+
+        if result and result.get("metadata"):
+            result["metadata"] = _json_loads(result["metadata"])
+
+        return result
 
     finally:
-
         conn.close()
 
-
-# ============================================================
-# CLOSE TRADE
-# ============================================================
 
 def close_position_event(
     symbol: str,
     exit_price: Optional[float] = None,
     profit_loss: Optional[float] = None,
-    status: str = "CLOSED",
     reason: Optional[str] = None,
-    realized_pl_pct: Optional[float] = None
-) -> bool:
+    event_type: str = "EXIT_FILLED",
+) -> Optional[int]:
+    """
+    Cierra una posición registrada y crea evento de salida.
+    """
 
-    event = get_open_position_event(
-        symbol
-    )
+    symbol = _normalize_symbol(symbol)
+    timestamp = now_iso()
 
-    if not event:
-        return False
-
-    event_id = event["id"]
-
-    updated = update_event(
-        event_id,
-
-        status=status,
-        state=status,
-
-        exit_price=exit_price,
-        exit_timestamp=now_iso(),
-
+    event_id = log_event(
+        symbol=symbol,
+        signal="EXIT",
+        status="CLOSED",
         profit_loss=profit_loss,
-        realized_pl=profit_loss,
-
-        realized_pl_pct=realized_pl_pct,
-
+        event_type=event_type,
         reason=reason,
-
-        event_type="EXIT"
+        exit_timestamp=timestamp,
+        exit_price=exit_price,
+        realized_pl=profit_loss,
+        state="CLOSED",
+        managed_by="trade_manager",
+        timestamp=timestamp,
     )
 
-    if updated:
+    close_position_state(
+        symbol=symbol,
+        realized_pl=profit_loss,
+        exit_price=exit_price,
+        state="CLOSED",
+    )
 
-        close_position_state(
-            symbol=symbol,
-
-            exit_price=exit_price,
-
-            realized_pl=profit_loss,
-
-            realized_pl_pct=realized_pl_pct,
-
-            state=status
-        )
-
-    return updated
+    return event_id
 
 
 # ============================================================
-# HISTORY
+# HISTORIAL
 # ============================================================
 
-def get_today_events()
--> List[Dict[str, Any]]:
-
+def get_today_events() -> List[Dict[str, Any]]:
     prefix = today_prefix()
 
     conn = get_connection()
 
     try:
-
         rows = conn.execute(
             """
             SELECT *
             FROM trade_events
-
             WHERE timestamp LIKE ?
-
-            ORDER BY id ASC
+            ORDER BY id DESC
             """,
-            (
-                prefix + "%",
-            )
+            (f"{prefix}%",),
         ).fetchall()
 
-        return [
-            dict(row)
-            for row in rows
-        ]
+        result = _rows_to_dicts(rows)
+
+        for item in result:
+            if item.get("metadata"):
+                item["metadata"] = _json_loads(item["metadata"])
+
+        return result
 
     finally:
-
         conn.close()
 
 
 def get_trade_history(
-    symbol: Optional[str] = None,
-    limit: int = 100
+    limit: int = 500,
 ) -> List[Dict[str, Any]]:
-
-    limit = max(
-        1,
-        min(
-            int(limit),
-            5000
-        )
-    )
+    limit = max(1, min(int(limit), 10000))
 
     conn = get_connection()
 
     try:
+        rows = conn.execute(
+            """
+            SELECT *
+            FROM trade_events
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
 
-        if symbol:
+        result = _rows_to_dicts(rows)
 
-            rows = conn.execute(
-                """
-                SELECT *
-                FROM trade_events
+        for item in result:
+            if item.get("metadata"):
+                item["metadata"] = _json_loads(item["metadata"])
 
-                WHERE symbol = ?
-
-                ORDER BY id DESC
-
-                LIMIT ?
-                """,
-                (
-                    symbol,
-                    limit
-                )
-            ).fetchall()
-
-        else:
-
-            rows = conn.execute(
-                """
-                SELECT *
-                FROM trade_events
-
-                ORDER BY id DESC
-
-                LIMIT ?
-                """,
-                (limit,)
-            ).fetchall()
-
-        return [
-            dict(row)
-            for row in rows
-        ]
+        return result
 
     finally:
-
         conn.close()
 
 
 # ============================================================
-# REALIZED P/L
+# P/L
 # ============================================================
 
 def get_today_profit_loss() -> float:
     """
-    Realized P/L only.
+    P/L realizado de posiciones cerradas hoy.
 
-    Management events are excluded.
+    Se toma de position_state para evitar sumar arbitrariamente
+    eventos repetidos.
     """
 
     prefix = today_prefix()
@@ -2078,118 +1604,81 @@ def get_today_profit_loss() -> float:
     conn = get_connection()
 
     try:
-
         row = conn.execute(
             """
-            SELECT
-                COALESCE(
-                    SUM(
-                        COALESCE(
-                            realized_pl,
-                            profit_loss,
-                            0
-                        )
-                    ),
-                    0
-                )
-
-            FROM trade_events
-
-            WHERE timestamp LIKE ?
-
-              AND (
-
-                    state IN (
-                        'CLOSED',
-                        'STOPPED',
-                        'EXIT_FILLED'
-                    )
-
-                    OR
-
-                    status IN (
-                        'CLOSED',
-                        'STOPPED',
-                        'EXIT_FILLED'
-                    )
-
-                  )
+            SELECT COALESCE(SUM(realized_pl), 0)
+            FROM position_state
+            WHERE last_update LIKE ?
+              AND UPPER(state) IN (
+                  'CLOSED',
+                  'STOPPED',
+                  'EXIT_FILLED'
+              )
             """,
-            (
-                prefix + "%",
-            )
+            (f"{prefix}%",),
         ).fetchone()
 
-        return float(
-            row[0] or 0.0
-        )
+        return float(row[0] or 0.0)
 
     finally:
-
         conn.close()
 
 
 def get_today_loss() -> float:
-
     pnl = get_today_profit_loss()
 
     return abs(pnl) if pnl < 0 else 0.0
 
 
 def get_today_profit() -> float:
-
     pnl = get_today_profit_loss()
 
     return pnl if pnl > 0 else 0.0
 
 
-# ============================================================
-# TRADE COUNT
-# ============================================================
-
 def get_today_trade_count() -> int:
+    """
+    Cuenta entradas únicas del día.
+
+    Prioridad:
+    1. event_key
+    2. order_id
+    3. id como fallback
+    """
 
     prefix = today_prefix()
 
     conn = get_connection()
 
     try:
-
         row = conn.execute(
             """
             SELECT COUNT(*)
-
-            FROM trade_events
-
-            WHERE timestamp LIKE ?
-
-              AND (
-
-                    event_type IN (
-                        'ENTRY_FILLED',
-                        'ENTRY'
-                    )
-
-                    OR
-
-                    status IN (
-                        'FILLED',
-                        'POSITION_OPEN'
-                    )
-
+            FROM (
+                SELECT
+                    COALESCE(
+                        NULLIF(event_key, ''),
+                        NULLIF(order_id, ''),
+                        CAST(id AS TEXT)
+                    ) AS unique_trade
+                FROM trade_events
+                WHERE timestamp LIKE ?
+                  AND UPPER(
+                      COALESCE(event_type, '')
+                  ) IN (
+                      'ENTRY',
+                      'ENTRY_SUBMITTED',
+                      'ENTRY_FILLED'
                   )
-            """,
-            (
-                prefix + "%",
+                GROUP BY unique_trade
             )
+            """,
+            (f"{prefix}%",),
         ).fetchone()
 
-        return int(
-            row[0] or 0
-        )
+        return int(row[0] or 0)
 
     finally:
-
         conn.close()
 
 
@@ -2198,183 +1687,156 @@ def get_today_trade_count() -> int:
 # ============================================================
 
 def log_system_event(
+    level: str,
     event_type: str,
-    severity: str = "INFO",
-    symbol: Optional[str] = None,
     message: Optional[str] = None,
-    data: Optional[Any] = None
+    component: Optional[str] = None,
+    event_key: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
 ) -> int:
+    """
+    Registra eventos del sistema.
+
+    Si se proporciona event_key, evita duplicados.
+    """
+
+    level = str(level or "INFO").upper()
+    event_type = str(event_type or "SYSTEM").upper()
 
     conn = get_connection()
 
     try:
+        if event_key:
+            existing = conn.execute(
+                """
+                SELECT id
+                FROM system_events
+                WHERE event_key=?
+                LIMIT 1
+                """,
+                (event_key,),
+            ).fetchone()
 
-        cursor = conn.cursor()
+            if existing:
+                return int(existing["id"])
 
-        cursor.execute(
+        cursor = conn.execute(
             """
             INSERT INTO system_events (
-
                 timestamp,
+                level,
                 event_type,
-                severity,
-                symbol,
                 message,
+                component,
+                event_key,
                 metadata
-
             )
-
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 now_iso(),
+                level,
                 event_type,
-                severity,
-                symbol,
                 message,
-                json_dumps(data)
-            )
+                component,
+                event_key,
+                _json_dumps(metadata),
+            ),
         )
 
         conn.commit()
 
-        return int(
-            cursor.lastrowid
-        )
-
-    except Exception:
-
-        conn.rollback()
-        raise
+        return int(cursor.lastrowid)
 
     finally:
-
         conn.close()
 
 
 def get_recent_system_events(
-    limit: int = 100
+    limit: int = 100,
 ) -> List[Dict[str, Any]]:
-
-    limit = max(
-        1,
-        min(
-            int(limit),
-            5000
-        )
-    )
+    limit = max(1, min(int(limit), 5000))
 
     conn = get_connection()
 
     try:
-
         rows = conn.execute(
             """
             SELECT *
             FROM system_events
-
             ORDER BY id DESC
-
             LIMIT ?
             """,
-            (limit,)
+            (limit,),
         ).fetchall()
 
-        results = []
+        result = _rows_to_dicts(rows)
 
-        for row in rows:
+        for item in result:
+            if item.get("metadata"):
+                item["metadata"] = _json_loads(item["metadata"])
 
-            result = dict(row)
-
-            result["metadata"] = json_loads(
-                result.get("metadata")
-            )
-
-            results.append(result)
-
-        return results
+        return result
 
     finally:
-
         conn.close()
 
 
 # ============================================================
-# AUDIT LOG
+# AUDITORÍA
 # ============================================================
 
 def log_audit(
-    entity_type: str,
     action: str,
-    entity_id: Optional[str] = None,
-    old_state: Optional[Any] = None,
-    new_state: Optional[Any] = None,
+    component: Optional[str] = None,
+    symbol: Optional[str] = None,
+    order_id: Optional[str] = None,
+    old_state: Optional[str] = None,
+    new_state: Optional[str] = None,
     reason: Optional[str] = None,
-    metadata: Optional[Any] = None
+    metadata: Optional[Dict[str, Any]] = None,
 ) -> int:
-
     conn = get_connection()
 
     try:
-
-        cursor = conn.cursor()
-
-        cursor.execute(
+        cursor = conn.execute(
             """
             INSERT INTO audit_log (
-
                 timestamp,
-
-                entity_type,
-                entity_id,
-
                 action,
-
+                component,
+                symbol,
+                order_id,
                 old_state,
                 new_state,
-
                 reason,
-
                 metadata
             )
-
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 now_iso(),
-
-                entity_type,
-                entity_id,
-
                 action,
-
-                json_dumps(old_state),
-                json_dumps(new_state),
-
+                component,
+                _normalize_symbol(symbol),
+                order_id,
+                old_state,
+                new_state,
                 reason,
-
-                json_dumps(metadata)
-            )
+                _json_dumps(metadata),
+            ),
         )
 
         conn.commit()
 
-        return int(
-            cursor.lastrowid
-        )
-
-    except Exception:
-
-        conn.rollback()
-        raise
+        return int(cursor.lastrowid)
 
     finally:
-
         conn.close()
 
 
 # ============================================================
-# PORTFOLIO SNAPSHOT
+# PORTFOLIO SNAPSHOTS
 # ============================================================
 
 def save_portfolio_snapshot(
@@ -2384,325 +1846,311 @@ def save_portfolio_snapshot(
     market_value: Optional[float] = None,
     total_exposure: Optional[float] = None,
     portfolio_risk: Optional[float] = None,
-    daily_pl: Optional[float] = None,
+    daily_profit_loss: Optional[float] = None,
     open_positions: Optional[int] = None,
-    open_orders: Optional[int] = None,
-    metadata: Optional[Any] = None
+    metadata: Optional[Dict[str, Any]] = None,
 ) -> int:
-
     conn = get_connection()
 
     try:
-
-        cursor = conn.cursor()
-
-        cursor.execute(
+        cursor = conn.execute(
             """
             INSERT INTO portfolio_snapshots (
-
                 timestamp,
-
                 equity,
                 cash,
                 buying_power,
-
                 market_value,
-
                 total_exposure,
                 portfolio_risk,
-
-                daily_pl,
-
+                daily_profit_loss,
                 open_positions,
-                open_orders,
-
                 metadata
             )
-
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 now_iso(),
-
-                equity,
-                cash,
-                buying_power,
-
-                market_value,
-
-                total_exposure,
-                portfolio_risk,
-
-                daily_pl,
-
-                open_positions,
-                open_orders,
-
-                json_dumps(metadata)
-            )
+                _safe_float(equity),
+                _safe_float(cash),
+                _safe_float(buying_power),
+                _safe_float(market_value),
+                _safe_float(total_exposure),
+                _safe_float(portfolio_risk),
+                _safe_float(daily_profit_loss),
+                _safe_int(open_positions),
+                _json_dumps(metadata),
+            ),
         )
 
         conn.commit()
 
-        return int(
-            cursor.lastrowid
-        )
-
-    except Exception:
-
-        conn.rollback()
-        raise
+        return int(cursor.lastrowid)
 
     finally:
-
         conn.close()
 
 
 def get_recent_portfolio_snapshots(
-    limit: int = 100
+    limit: int = 100,
 ) -> List[Dict[str, Any]]:
-
-    limit = max(
-        1,
-        min(
-            int(limit),
-            5000
-        )
-    )
+    limit = max(1, min(int(limit), 5000))
 
     conn = get_connection()
 
     try:
-
         rows = conn.execute(
             """
             SELECT *
             FROM portfolio_snapshots
-
             ORDER BY id DESC
-
             LIMIT ?
             """,
-            (limit,)
+            (limit,),
         ).fetchall()
 
-        results = []
+        result = _rows_to_dicts(rows)
 
-        for row in rows:
+        for item in result:
+            if item.get("metadata"):
+                item["metadata"] = _json_loads(item["metadata"])
 
-            result = dict(row)
-
-            result["metadata"] = json_loads(
-                result.get("metadata")
-            )
-
-            results.append(result)
-
-        return results
+        return result
 
     finally:
-
         conn.close()
 
 
 # ============================================================
-# RECONCILIATION
+# RECONCILIACIÓN
 # ============================================================
 
 def log_reconciliation(
-    entity_type: str,
-    status: str,
-    symbol: Optional[str] = None,
-    local_state: Optional[Any] = None,
-    alpaca_state: Optional[Any] = None,
-    discrepancy: Optional[str] = None,
-    resolution: Optional[str] = None,
-    metadata: Optional[Any] = None
+    symbol: Optional[str],
+    source: str,
+    issue_type: str,
+    severity: str,
+    database_quantity: Optional[float] = None,
+    alpaca_quantity: Optional[float] = None,
+    database_state: Optional[str] = None,
+    alpaca_state: Optional[str] = None,
+    resolved: bool = False,
+    details: Optional[Dict[str, Any]] = None,
 ) -> int:
-
     conn = get_connection()
 
     try:
-
-        cursor = conn.cursor()
-
-        cursor.execute(
+        cursor = conn.execute(
             """
             INSERT INTO reconciliation_log (
-
                 timestamp,
-
                 symbol,
-
-                entity_type,
-
-                local_state,
-
+                source,
+                issue_type,
+                severity,
+                database_quantity,
+                alpaca_quantity,
+                database_state,
                 alpaca_state,
-
-                status,
-
-                discrepancy,
-
-                resolution,
-
-                metadata
+                resolved,
+                details
             )
-
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 now_iso(),
-
-                symbol,
-
-                entity_type,
-
-                json_dumps(local_state),
-                json_dumps(alpaca_state),
-
-                status,
-
-                discrepancy,
-
-                resolution,
-
-                json_dumps(metadata)
-            )
+                _normalize_symbol(symbol),
+                source,
+                issue_type,
+                severity,
+                _safe_float(database_quantity),
+                _safe_float(alpaca_quantity),
+                database_state,
+                alpaca_state,
+                1 if resolved else 0,
+                _json_dumps(details),
+            ),
         )
 
         conn.commit()
 
-        return int(
-            cursor.lastrowid
-        )
-
-    except Exception:
-
-        conn.rollback()
-        raise
+        return int(cursor.lastrowid)
 
     finally:
-
         conn.close()
 
 
-# ============================================================
-# ORPHAN DETECTION
-# ============================================================
-
 def get_database_open_symbols() -> List[str]:
-    """
-    Symbols locally marked OPEN.
-    """
-
     conn = get_connection()
 
     try:
-
         rows = conn.execute(
             """
             SELECT symbol
             FROM position_state
-            WHERE state = 'OPEN'
+            WHERE quantity > 0
+              AND UPPER(state) NOT IN (
+                  'CLOSED',
+                  'STOPPED',
+                  'EXIT_FILLED'
+              )
             ORDER BY symbol
             """
         ).fetchall()
 
         return [
-            row["symbol"]
+            _normalize_symbol(row["symbol"])
             for row in rows
         ]
 
     finally:
-
         conn.close()
 
 
 def find_orphaned_database_positions(
-    alpaca_symbols: List[str]
+    alpaca_symbols: Sequence[str],
 ) -> List[str]:
     """
-    Find positions stored as OPEN locally but absent from Alpaca.
-
-    Does not modify anything.
+    DB dice que existen, Alpaca dice que no.
     """
 
     alpaca_set = {
-        str(symbol).upper()
+        _normalize_symbol(symbol)
         for symbol in alpaca_symbols
     }
 
-    local_symbols = set(
-        get_database_open_symbols()
-    )
+    db_symbols = set(get_database_open_symbols())
 
-    return sorted(
-        local_symbols - alpaca_set
-    )
+    return sorted(db_symbols - alpaca_set)
 
 
 def find_unknown_alpaca_positions(
-    alpaca_symbols: List[str]
+    alpaca_symbols: Sequence[str],
 ) -> List[str]:
     """
-    Find Alpaca positions not known as OPEN in SQLite.
-
-    Does not close anything automatically.
+    Alpaca tiene posiciones que DB no conoce.
     """
 
     alpaca_set = {
-        str(symbol).upper()
+        _normalize_symbol(symbol)
         for symbol in alpaca_symbols
     }
 
-    local_symbols = set(
-        get_database_open_symbols()
+    db_symbols = set(get_database_open_symbols())
+
+    return sorted(alpaca_set - db_symbols)
+
+
+def reconcile_positions(
+    alpaca_positions: Sequence[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    Compara posiciones conocidas por DB contra posiciones de Alpaca.
+
+    NO modifica automáticamente posiciones de Alpaca.
+    """
+
+    alpaca_symbols = [
+        _normalize_symbol(
+            item.get("symbol")
+        )
+        for item in alpaca_positions
+        if item.get("symbol")
+    ]
+
+    orphaned_db = find_orphaned_database_positions(
+        alpaca_symbols
     )
 
-    return sorted(
-        alpaca_set - local_symbols
+    unknown_alpaca = find_unknown_alpaca_positions(
+        alpaca_symbols
     )
 
+    for symbol in orphaned_db:
+        log_reconciliation(
+            symbol=symbol,
+            source="reconcile_positions",
+            issue_type="ORPHANED_DATABASE_POSITION",
+            severity="WARNING",
+            database_quantity=(
+                get_position_state(symbol) or {}
+            ).get("quantity"),
+            alpaca_quantity=0,
+            database_state="OPEN",
+            alpaca_state="ABSENT",
+            details={
+                "message": (
+                    "DB tiene posición que no aparece "
+                    "en Alpaca."
+                )
+            },
+        )
 
-# ============================================================
-# DATABASE HEALTH
-# ============================================================
+    for symbol in unknown_alpaca:
+        alpaca_item = next(
+            (
+                item
+                for item in alpaca_positions
+                if _normalize_symbol(
+                    item.get("symbol")
+                ) == symbol
+            ),
+            {},
+        )
 
-def database_health_check()
--> Dict[str, Any]:
+        log_reconciliation(
+            symbol=symbol,
+            source="reconcile_positions",
+            issue_type="UNKNOWN_ALPACA_POSITION",
+            severity="CRITICAL",
+            database_quantity=0,
+            alpaca_quantity=_safe_float(
+                alpaca_item.get("quantity")
+            ),
+            database_state="ABSENT",
+            alpaca_state="OPEN",
+            details={
+                "message": (
+                    "Alpaca tiene posición que DB "
+                    "no conoce."
+                )
+            },
+        )
 
-    result = {
-
-        "database": DATABASE_PATH,
-
-        "connected": False,
-
-        "integrity": False,
-
-        "schema_version": None,
-
-        "trade_events": 0,
-
-        "open_positions": 0,
-
-        "orders": 0,
-
-        "system_events": 0,
-
-        "audit_events": 0,
-
-        "snapshots": 0,
-
-        "reconciliation_events": 0,
-
-        "error": None
+    return {
+        "alpaca_symbols": sorted(set(alpaca_symbols)),
+        "orphaned_database_positions": orphaned_db,
+        "unknown_alpaca_positions": unknown_alpaca,
+        "clean": not orphaned_db and not unknown_alpaca,
     }
 
-    conn = None
+
+# ============================================================
+# SALUD DE BASE DE DATOS
+# ============================================================
+
+def database_health_check() -> Dict[str, Any]:
+    """
+    Diagnóstico completo de SQLite.
+    """
+
+    result: Dict[str, Any] = {
+        "database_path": DATABASE_PATH,
+        "connected": False,
+        "integrity": False,
+        "schema_version": None,
+        "bot_version": BOT_VERSION,
+        "trade_events": 0,
+        "open_positions": 0,
+        "orders": 0,
+        "system_events": 0,
+        "audit_events": 0,
+        "portfolio_snapshots": 0,
+        "reconciliation_events": 0,
+        "error": None,
+    }
 
     try:
-
         conn = get_connection()
 
         result["connected"] = True
@@ -2711,208 +2159,241 @@ def database_health_check()
             "PRAGMA integrity_check"
         ).fetchone()
 
-        if integrity:
+        result["integrity"] = (
+            integrity is not None
+            and str(integrity[0]).lower() == "ok"
+        )
 
-            result["integrity"] = (
-                integrity[0] == "ok"
-            )
-
-        schema = conn.execute(
+        meta = conn.execute(
             """
             SELECT value
             FROM schema_meta
             WHERE key='schema_version'
-            LIMIT 1
             """
         ).fetchone()
 
-        if schema:
-            result["schema_version"] = (
-                schema["value"]
+        if meta:
+            result["schema_version"] = _safe_int(
+                meta["value"]
             )
 
-        result["trade_events"] = int(
-            conn.execute(
-                "SELECT COUNT(*) FROM trade_events"
-            ).fetchone()[0]
-            or 0
-        )
-
-        result["open_positions"] = int(
-            conn.execute(
-                """
+        tables = {
+            "trade_events": """
+                SELECT COUNT(*) FROM trade_events
+            """,
+            "open_positions": """
                 SELECT COUNT(*)
                 FROM position_state
-                WHERE state='OPEN'
-                """
-            ).fetchone()[0]
-            or 0
-        )
-
-        result["orders"] = int(
-            conn.execute(
-                "SELECT COUNT(*) FROM order_state"
-            ).fetchone()[0]
-            or 0
-        )
-
-        result["system_events"] = int(
-            conn.execute(
-                "SELECT COUNT(*) FROM system_events"
-            ).fetchone()[0]
-            or 0
-        )
-
-        result["audit_events"] = int(
-            conn.execute(
-                "SELECT COUNT(*) FROM audit_log"
-            ).fetchone()[0]
-            or 0
-        )
-
-        result["snapshots"] = int(
-            conn.execute(
-                """
+                WHERE quantity > 0
+                  AND UPPER(state) NOT IN (
+                      'CLOSED',
+                      'STOPPED',
+                      'EXIT_FILLED'
+                  )
+            """,
+            "orders": """
+                SELECT COUNT(*) FROM order_state
+            """,
+            "system_events": """
+                SELECT COUNT(*) FROM system_events
+            """,
+            "audit_events": """
+                SELECT COUNT(*) FROM audit_log
+            """,
+            "portfolio_snapshots": """
                 SELECT COUNT(*)
                 FROM portfolio_snapshots
-                """
-            ).fetchone()[0]
-            or 0
-        )
-
-        result["reconciliation_events"] = int(
-            conn.execute(
-                """
+            """,
+            "reconciliation_events": """
                 SELECT COUNT(*)
                 FROM reconciliation_log
-                """
-            ).fetchone()[0]
-            or 0
-        )
+            """,
+        }
+
+        for key, sql in tables.items():
+            row = conn.execute(sql).fetchone()
+            result[key] = int(row[0] or 0)
+
+        conn.close()
 
     except Exception as exc:
-
         result["error"] = str(exc)
-
-    finally:
-
-        if conn:
-            conn.close()
 
     return result
 
 
 # ============================================================
-# DATABASE BACKUP
+# BACKUP
 # ============================================================
 
 def backup_database(
-    backup_path: Optional[str] = None
-) -> str:
+    destination: Optional[str] = None,
+) -> Optional[str]:
     """
-    Create a SQLite backup using the native backup API.
+    Crea backup consistente mediante SQLite backup API.
 
-    Returns:
-        Backup path.
+    Si destination no existe, crea:
+        trade_history_backup_TIMESTAMP.db
     """
 
-    if backup_path is None:
+    if not os.path.exists(DATABASE_PATH):
+        return None
 
+    if destination is None:
         timestamp = datetime.now(
             timezone.utc
-        ).strftime(
-            "%Y%m%d_%H%M%S"
+        ).strftime("%Y%m%d_%H%M%S")
+
+        destination = (
+            f"trade_history_backup_{timestamp}.db"
         )
 
-        backup_path = (
-            f"{DATABASE_PATH}.{timestamp}.bak"
-        )
+    destination = str(destination)
+
+    destination_dir = os.path.dirname(
+        os.path.abspath(destination)
+    )
+
+    os.makedirs(
+        destination_dir,
+        exist_ok=True,
+    )
 
     source = get_connection()
 
-    destination = sqlite3.connect(
-        backup_path
-    )
-
     try:
-
-        source.backup(
-            destination
+        target = sqlite3.connect(
+            destination,
+            timeout=DB_TIMEOUT,
         )
 
-    finally:
+        try:
+            source.backup(target)
+            target.commit()
+        finally:
+            target.close()
 
-        destination.close()
+    finally:
         source.close()
 
-    return backup_path
+    return destination
 
 
 # ============================================================
-# STARTUP
+# LIMPIEZA SEGURA DE WAL
+# ============================================================
+
+def checkpoint_database() -> bool:
+    """
+    Fuerza checkpoint del WAL.
+
+    No elimina historial.
+    """
+
+    conn = get_connection()
+
+    try:
+        conn.execute(
+            "PRAGMA wal_checkpoint(PASSIVE)"
+        )
+
+        return True
+
+    except Exception:
+        return False
+
+    finally:
+        conn.close()
+
+
+# ============================================================
+# ESTADÍSTICAS
+# ============================================================
+
+def get_database_stats() -> Dict[str, Any]:
+    """
+    Estadísticas generales de persistencia.
+    """
+
+    health = database_health_check()
+
+    return {
+        "database_path": DATABASE_PATH,
+        "schema_version": health.get("schema_version"),
+        "bot_version": health.get("bot_version"),
+        "trade_events": health.get("trade_events"),
+        "open_positions": health.get("open_positions"),
+        "orders": health.get("orders"),
+        "system_events": health.get("system_events"),
+        "audit_events": health.get("audit_events"),
+        "portfolio_snapshots": health.get(
+            "portfolio_snapshots"
+        ),
+        "reconciliation_events": health.get(
+            "reconciliation_events"
+        ),
+        "integrity": health.get("integrity"),
+    }
+
+
+# ============================================================
+# ARRANQUE
 # ============================================================
 
 initialize_database()
 
 
-if __name__ == "__main__":
+# ============================================================
+# SELF TEST
+# ============================================================
 
-    print()
+if __name__ == "__main__":
     print("=" * 72)
-    print("          AI TRADER — DATABASE V5 OMNIPRESENT")
+    print("AI TRADER — DATABASE V5.1 OMNIPRESENTE")
     print("=" * 72)
 
     health = database_health_check()
 
     print(
-        f"Database:              {health['database']}"
+        f"Database:       {health.get('database_path')}"
     )
-
     print(
-        f"Connected:             {health['connected']}"
+        f"Connected:      {health.get('connected')}"
     )
-
     print(
-        f"Integrity:             {health['integrity']}"
+        f"Integrity:      {health.get('integrity')}"
     )
-
     print(
-        f"Schema:                {health['schema_version']}"
+        f"Schema:         {health.get('schema_version')}"
     )
-
     print(
-        f"Trade events:          {health['trade_events']}"
+        f"Bot version:    {health.get('bot_version')}"
     )
-
     print(
-        f"Open positions:        {health['open_positions']}"
+        f"Trade events:   {health.get('trade_events')}"
     )
-
     print(
-        f"Orders tracked:        {health['orders']}"
+        f"Open positions: {health.get('open_positions')}"
     )
-
     print(
-        f"System events:         {health['system_events']}"
+        f"Orders:         {health.get('orders')}"
     )
-
     print(
-        f"Audit events:          {health['audit_events']}"
+        f"System events:  {health.get('system_events')}"
     )
-
     print(
-        f"Portfolio snapshots:   {health['snapshots']}"
+        f"Audit events:   {health.get('audit_events')}"
     )
-
     print(
-        f"Reconciliation logs:   {health['reconciliation_events']}"
+        f"Snapshots:      {health.get('portfolio_snapshots')}"
+    )
+    print(
+        f"Reconciliation:{health.get('reconciliation_events')}"
     )
 
-    if health["error"]:
-
+    if health.get("error"):
         print(
-            f"ERROR:                 {health['error']}"
+            f"ERROR:          {health.get('error')}"
         )
 
     print("=" * 72)
-    print()
