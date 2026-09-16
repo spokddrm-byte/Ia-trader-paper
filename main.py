@@ -1,18 +1,50 @@
+# ============================================================
+# AI TRADER — MAIN V3
+# ============================================================
+#
+# CEREBRO MULTI-ACTIVO
+#
+# FUNCIONES:
+#   - Escáner de 25 activos
+#   - Ranking de oportunidades
+#   - Score 0-100
+#   - Tendencia
+#   - Momentum
+#   - RSI
+#   - Volatilidad ATR
+#   - Volumen
+#   - Fuerza relativa contra SPY
+#   - Control de cartera
+#   - Control de posiciones
+#   - Control de órdenes abiertas
+#   - Control de buying power
+#   - Risk Manager V3
+#   - Stop dinámico por ATR
+#   - Protección contra órdenes duplicadas
+#   - Límite de nuevas entradas por ciclo
+#   - Registro de señales aceptadas/rechazadas
+#   - Paper Trading
+#
+# ============================================================
+
+
 import os
-import uuid
-from datetime import datetime, timedelta, timezone
+import math
+import time
+import traceback
+from datetime import datetime, timezone
 
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import (
-    GetOrdersRequest,
     MarketOrderRequest,
-    StopLossRequest
+    StopLossRequest,
+    GetOrdersRequest
 )
 from alpaca.trading.enums import (
     OrderSide,
+    TimeInForce,
     OrderClass,
-    QueryOrderStatus,
-    TimeInForce
+    QueryOrderStatus
 )
 
 from alpaca.data.historical import StockHistoricalDataClient
@@ -20,25 +52,46 @@ from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 from alpaca.data.enums import DataFeed
 
-from indicators import sma, ema, rsi, volatility
-from risk_manager import risk_check, calculate_position_size
+from indicators import sma, ema, rsi
+
+from risk_manager import (
+    risk_check,
+    calculate_position_size,
+    calculate_position_value,
+    calculate_trade_risk,
+    calculate_trade_risk_percent,
+    calculate_portfolio_risk,
+    calculate_total_exposure,
+    symbol_exposure_check,
+    MAX_OPEN_POSITIONS,
+    MAX_TOTAL_EXPOSURE,
+    MAX_PORTFOLIO_RISK,
+    MAX_RISK_PER_TRADE,
+    MAX_DAILY_LOSS
+)
 
 from database import (
     initialize_database,
     log_event,
-    update_event,
-    get_event_by_order_id,
-    get_open_position_event,
     get_today_trade_count,
     get_today_loss,
-    get_today_profit_loss
+    get_today_profit_loss,
+    get_open_position_event
 )
 
 
 # ============================================================
-# AI TRADER V2
-# UNIVERSO INICIAL: 25 ACTIVOS
+# CONFIGURACIÓN
 # ============================================================
+
+API_KEY = os.getenv("APCA_API_KEY_ID")
+API_SECRET = os.getenv("APCA_API_SECRET_KEY")
+
+PAPER_TRADING = True
+
+# ------------------------------------------------------------
+# UNIVERSO
+# ------------------------------------------------------------
 
 SYMBOLS = [
     "AAPL",
@@ -68,126 +121,1295 @@ SYMBOLS = [
     "QQQ"
 ]
 
+BENCHMARK = "SPY"
 
-# ============================================================
-# CONFIGURACIÓN
-# ============================================================
 
-MIN_BARS = 20
+# ------------------------------------------------------------
+# DATOS
+# ------------------------------------------------------------
+
 LOOKBACK_DAYS = 180
+MIN_BARS = 60
 
-# Máximo de candidatos que pueden intentar entrar
+DATA_FEED = DataFeed.IEX
+
+
+# ------------------------------------------------------------
+# ESCÁNER
+# ------------------------------------------------------------
+
 MAX_NEW_POSITIONS_PER_CYCLE = 2
 
+MIN_SCORE_TO_TRADE = 70
+
+MIN_PRICE = 5.0
+
+MIN_AVG_VOLUME = 500_000
+
+
+# ------------------------------------------------------------
+# INDICADORES
+# ------------------------------------------------------------
+
+SMA_FAST = 20
+EMA_FAST = 20
+RSI_PERIOD = 14
+
+ATR_PERIOD = 14
+
+RELATIVE_STRENGTH_PERIOD = 20
+
+VOLUME_PERIOD = 20
+
+
+# ------------------------------------------------------------
+# STOP
+# ------------------------------------------------------------
+
+ATR_STOP_MULTIPLIER = 2.0
+
+MIN_STOP_PERCENT = 0.005
+
+MAX_STOP_PERCENT = 0.10
+
+
+# ------------------------------------------------------------
+# ESTRATEGIA
+# ------------------------------------------------------------
+
+MIN_RSI = 45
+MAX_RSI = 68
+
+
+# ------------------------------------------------------------
+# PAUSA ENTRE PETICIONES
+# ------------------------------------------------------------
+
+REQUEST_DELAY = 0.15
+
 
 # ============================================================
-# FUNCIÓN: ANALIZAR ACTIVO
+# COLORES / OUTPUT
 # ============================================================
 
-def analyze_symbol(data_client, symbol):
+RESET = "\033[0m"
+GREEN = "\033[92m"
+RED = "\033[91m"
+YELLOW = "\033[93m"
+CYAN = "\033[96m"
+MAGENTA = "\033[95m"
+WHITE = "\033[97m"
+
+
+# ============================================================
+# UTILIDADES
+# ============================================================
+
+def safe_float(value, default=0.0):
+
+    try:
+        return float(value)
+
+    except (TypeError, ValueError):
+        return default
+
+
+def safe_int(value, default=0):
+
+    try:
+        return int(float(value))
+
+    except (TypeError, ValueError):
+        return default
+
+
+def clamp(value, minimum, maximum):
+
+    return max(
+        minimum,
+        min(
+            maximum,
+            value
+        )
+    )
+
+
+def now_utc():
+
+    return datetime.now(
+        timezone.utc
+    )
+
+
+def print_header():
+
+    print()
+    print("=" * 72)
+    print("              AI TRADER — V3 GOD MODE")
+    print("=" * 72)
+    print()
+
+
+# ============================================================
+# CONEXIÓN
+# ============================================================
+
+def create_clients():
+
+    if not API_KEY or not API_SECRET:
+
+        raise RuntimeError(
+            "FALTAN APCA_API_KEY_ID O APCA_API_SECRET_KEY"
+        )
+
+    trading_client = TradingClient(
+        API_KEY,
+        API_SECRET,
+        paper=PAPER_TRADING
+    )
+
+    data_client = StockHistoricalDataClient(
+        API_KEY,
+        API_SECRET
+    )
+
+    return (
+        trading_client,
+        data_client
+    )
+
+
+# ============================================================
+# CUENTA
+# ============================================================
+
+def get_account_snapshot(
+    trading_client
+):
+
+    account = trading_client.get_account()
+
+    equity = safe_float(
+        account.equity
+    )
+
+    buying_power = safe_float(
+        account.buying_power
+    )
+
+    cash = safe_float(
+        account.cash
+    )
+
+    return {
+        "equity": equity,
+        "buying_power": buying_power,
+        "cash": cash,
+        "status": str(account.status)
+    }
+
+
+# ============================================================
+# MERCADO
+# ============================================================
+
+def check_market(
+    trading_client
+):
+
+    clock = trading_client.get_clock()
+
+    return (
+        bool(clock.is_open),
+        clock
+    )
+
+
+# ============================================================
+# POSICIONES ALPACA
+# ============================================================
+
+def get_positions(
+    trading_client
+):
+
+    positions = trading_client.get_all_positions()
+
+    result = {}
+
+    for position in positions:
+
+        symbol = str(
+            position.symbol
+        ).upper()
+
+        qty = safe_float(
+            position.qty
+        )
+
+        market_value = safe_float(
+            position.market_value
+        )
+
+        avg_entry = safe_float(
+            position.avg_entry_price
+        )
+
+        current_price = safe_float(
+            position.current_price
+        )
+
+        unrealized_pl = safe_float(
+            position.unrealized_pl
+        )
+
+        result[symbol] = {
+            "symbol": symbol,
+            "qty": qty,
+            "market_value": market_value,
+            "avg_entry_price": avg_entry,
+            "current_price": current_price,
+            "unrealized_pl": unrealized_pl
+        }
+
+    return result
+
+
+# ============================================================
+# ÓRDENES ABIERTAS
+# ============================================================
+
+def get_open_orders(
+    trading_client
+):
+
+    request = GetOrdersRequest(
+        status=QueryOrderStatus.OPEN,
+        limit=500,
+        nested=True
+    )
+
+    orders = trading_client.get_orders(
+        filter=request
+    )
+
+    result = {}
+
+    for order in orders:
+
+        symbol = str(
+            order.symbol
+        ).upper()
+
+        result.setdefault(
+            symbol,
+            []
+        )
+
+        result[symbol].append(
+            order
+        )
+
+    return result
+
+
+# ============================================================
+# POSICIÓN / ORDEN EXISTENTE
+# ============================================================
+
+def symbol_is_locked(
+    symbol,
+    positions,
+    open_orders
+):
+
+    if symbol in positions:
+
+        return True
+
+    if symbol in open_orders:
+
+        return True
+
+    return False
+
+
+# ============================================================
+# OBTENER BARRAS
+# ============================================================
+
+def get_daily_bars(
+    data_client,
+    symbol
+):
+
+    request = StockBarsRequest(
+        symbol_or_symbols=symbol,
+        timeframe=TimeFrame.Day,
+        limit=LOOKBACK_DAYS,
+        feed=DATA_FEED
+    )
+
+    response = data_client.get_stock_bars(
+        request
+    )
 
     try:
 
-        end = datetime.now(timezone.utc)
-        start = end - timedelta(days=LOOKBACK_DAYS)
+        bars = response[symbol]
 
-        request = StockBarsRequest(
-            symbol_or_symbols=[symbol],
-            timeframe=TimeFrame.Day,
-            start=start,
-            end=end,
-            feed=DataFeed.IEX
+    except Exception:
+
+        return []
+
+    return list(bars)
+
+
+# ============================================================
+# ATR
+# ============================================================
+
+def calculate_atr(
+    bars,
+    period=14
+):
+
+    if len(bars) < period + 1:
+
+        return None
+
+    true_ranges = []
+
+    for i in range(1, len(bars)):
+
+        current = bars[i]
+        previous = bars[i - 1]
+
+        high = safe_float(
+            current.high
         )
 
-        bars = data_client.get_stock_bars(request)
+        low = safe_float(
+            current.low
+        )
 
-        if symbol not in bars:
-            print(f"{symbol}: SIN DATOS")
-            return None
+        previous_close = safe_float(
+            previous.close
+        )
 
-        symbol_bars = bars[symbol]
+        if high <= 0 or low <= 0:
 
-        closes = [
-            float(bar.close)
-            for bar in symbol_bars
-        ]
+            continue
 
-        if len(closes) < MIN_BARS:
-            print(
-                f"{symbol}: DATOS INSUFICIENTES "
-                f"({len(closes)} velas)"
+        tr = max(
+            high - low,
+            abs(high - previous_close),
+            abs(low - previous_close)
+        )
+
+        true_ranges.append(
+            tr
+        )
+
+    if len(true_ranges) < period:
+
+        return None
+
+    return (
+        sum(
+            true_ranges[-period:]
+        )
+        / period
+    )
+
+
+# ============================================================
+# ATR %
+# ============================================================
+
+def calculate_atr_percent(
+    price,
+    atr_value
+):
+
+    if price <= 0 or atr_value is None:
+
+        return 0.0
+
+    return (
+        atr_value
+        / price
+    )
+
+
+# ============================================================
+# VOLUMEN
+# ============================================================
+
+def calculate_average_volume(
+    bars,
+    period=20
+):
+
+    if len(bars) < period:
+
+        return None
+
+    volumes = [
+        safe_float(bar.volume)
+        for bar in bars[-period:]
+    ]
+
+    if not volumes:
+
+        return None
+
+    return (
+        sum(volumes)
+        / len(volumes)
+    )
+
+
+# ============================================================
+# FUERZA RELATIVA
+# ============================================================
+
+def calculate_relative_strength(
+    symbol_bars,
+    benchmark_bars,
+    period=20
+):
+
+    if (
+        len(symbol_bars) < period + 1
+        or len(benchmark_bars) < period + 1
+    ):
+
+        return None
+
+    symbol_start = safe_float(
+        symbol_bars[-period - 1].close
+    )
+
+    symbol_end = safe_float(
+        symbol_bars[-1].close
+    )
+
+    benchmark_start = safe_float(
+        benchmark_bars[-period - 1].close
+    )
+
+    benchmark_end = safe_float(
+        benchmark_bars[-1].close
+    )
+
+    if (
+        symbol_start <= 0
+        or benchmark_start <= 0
+    ):
+
+        return None
+
+    symbol_return = (
+        symbol_end
+        / symbol_start
+        - 1
+    )
+
+    benchmark_return = (
+        benchmark_end
+        / benchmark_start
+        - 1
+    )
+
+    return (
+        symbol_return
+        - benchmark_return
+    )
+
+
+# ============================================================
+# SCORE DE TENDENCIA
+# ============================================================
+
+def score_trend(
+    price,
+    sma_value,
+    ema_value
+):
+
+    score = 0
+
+    if sma_value is not None:
+
+        if price > sma_value:
+
+            score += 10
+
+    if ema_value is not None:
+
+        if price > ema_value:
+
+            score += 10
+
+    if (
+        ema_value is not None
+        and sma_value is not None
+    ):
+
+        if ema_value > sma_value:
+
+            score += 10
+
+    return score
+
+
+# ============================================================
+# SCORE RSI
+# ============================================================
+
+def score_rsi(
+    rsi_value
+):
+
+    if rsi_value is None:
+
+        return 0
+
+    if 50 <= rsi_value <= 62:
+
+        return 15
+
+    if 45 <= rsi_value < 50:
+
+        return 10
+
+    if 62 < rsi_value <= 68:
+
+        return 8
+
+    if 40 <= rsi_value < 45:
+
+        return 4
+
+    return 0
+
+
+# ============================================================
+# SCORE MOMENTUM
+# ============================================================
+
+def score_momentum(
+    bars
+):
+
+    if len(bars) < 21:
+
+        return 0
+
+    current = safe_float(
+        bars[-1].close
+    )
+
+    previous = safe_float(
+        bars[-21].close
+    )
+
+    if previous <= 0:
+
+        return 0
+
+    return_pct = (
+        current
+        / previous
+        - 1
+    )
+
+    if return_pct >= 0.10:
+
+        return 15
+
+    if return_pct >= 0.05:
+
+        return 12
+
+    if return_pct >= 0.02:
+
+        return 8
+
+    if return_pct > 0:
+
+        return 4
+
+    return 0
+
+
+# ============================================================
+# SCORE VOLUMEN
+# ============================================================
+
+def score_volume(
+    bars
+):
+
+    if len(bars) < VOLUME_PERIOD + 1:
+
+        return 0
+
+    average_volume = calculate_average_volume(
+        bars,
+        VOLUME_PERIOD
+    )
+
+    current_volume = safe_float(
+        bars[-1].volume
+    )
+
+    if (
+        average_volume is None
+        or average_volume <= 0
+    ):
+
+        return 0
+
+    ratio = (
+        current_volume
+        / average_volume
+    )
+
+    if ratio >= 1.50:
+
+        return 10
+
+    if ratio >= 1.20:
+
+        return 7
+
+    if ratio >= 1.00:
+
+        return 4
+
+    return 0
+
+
+# ============================================================
+# SCORE FUERZA RELATIVA
+# ============================================================
+
+def score_relative_strength(
+    relative_strength
+):
+
+    if relative_strength is None:
+
+        return 0
+
+    if relative_strength >= 0.08:
+
+        return 10
+
+    if relative_strength >= 0.04:
+
+        return 8
+
+    if relative_strength >= 0.01:
+
+        return 5
+
+    if relative_strength > 0:
+
+        return 2
+
+    return 0
+
+
+# ============================================================
+# SCORE VOLATILIDAD
+# ============================================================
+
+def score_volatility(
+    atr_percent
+):
+
+    if atr_percent <= 0:
+
+        return 0
+
+    # Queremos movimiento suficiente,
+    # pero no una locura.
+
+    if 0.015 <= atr_percent <= 0.045:
+
+        return 10
+
+    if 0.01 <= atr_percent < 0.015:
+
+        return 6
+
+    if 0.045 < atr_percent <= 0.07:
+
+        return 5
+
+    return 0
+
+
+# ============================================================
+# ANALIZAR ACTIVO
+# ============================================================
+
+def analyze_symbol(
+    symbol,
+    bars,
+    benchmark_bars
+):
+
+    if len(bars) < MIN_BARS:
+
+        return None
+
+    closes = [
+        safe_float(bar.close)
+        for bar in bars
+    ]
+
+    if not closes:
+
+        return None
+
+    price = closes[-1]
+
+    if price < MIN_PRICE:
+
+        return None
+
+    sma_value = sma(
+        closes,
+        SMA_FAST
+    )
+
+    ema_value = ema(
+        closes,
+        EMA_FAST
+    )
+
+    rsi_value = rsi(
+        closes,
+        RSI_PERIOD
+    )
+
+    atr_value = calculate_atr(
+        bars,
+        ATR_PERIOD
+    )
+
+    average_volume = calculate_average_volume(
+        bars,
+        VOLUME_PERIOD
+    )
+
+    current_volume = safe_float(
+        bars[-1].volume
+    )
+
+    relative_strength = calculate_relative_strength(
+        bars,
+        benchmark_bars,
+        RELATIVE_STRENGTH_PERIOD
+    )
+
+    atr_percent = calculate_atr_percent(
+        price,
+        atr_value
+    )
+
+    if (
+        sma_value is None
+        or ema_value is None
+        or rsi_value is None
+        or atr_value is None
+    ):
+
+        return None
+
+    # --------------------------------------------------------
+    # SCORE
+    # --------------------------------------------------------
+
+    trend_score = score_trend(
+        price,
+        sma_value,
+        ema_value
+    )
+
+    rsi_score = score_rsi(
+        rsi_value
+    )
+
+    momentum_score = score_momentum(
+        bars
+    )
+
+    volume_score = score_volume(
+        bars
+    )
+
+    relative_score = score_relative_strength(
+        relative_strength
+    )
+
+    volatility_score = score_volatility(
+        atr_percent
+    )
+
+    total_score = (
+        trend_score
+        + rsi_score
+        + momentum_score
+        + volume_score
+        + relative_score
+        + volatility_score
+    )
+
+    # --------------------------------------------------------
+    # FILTROS DUROS
+    # --------------------------------------------------------
+
+    bullish_trend = (
+        price > ema_value
+        and ema_value > sma_value
+    )
+
+    valid_rsi = (
+        MIN_RSI
+        <= rsi_value
+        <= MAX_RSI
+    )
+
+    positive_relative_strength = (
+        relative_strength is not None
+        and relative_strength > 0
+    )
+
+    enough_volume = (
+        average_volume is not None
+        and average_volume >= MIN_AVG_VOLUME
+    )
+
+    buy_signal = (
+        bullish_trend
+        and valid_rsi
+        and positive_relative_strength
+        and enough_volume
+        and total_score >= MIN_SCORE_TO_TRADE
+    )
+
+    # --------------------------------------------------------
+    # STOP ATR
+    # --------------------------------------------------------
+
+    raw_stop = (
+        price
+        - (
+            atr_value
+            * ATR_STOP_MULTIPLIER
+        )
+    )
+
+    stop_distance = (
+        price - raw_stop
+    ) / price
+
+    stop_distance = clamp(
+        stop_distance,
+        MIN_STOP_PERCENT,
+        MAX_STOP_PERCENT
+    )
+
+    stop_price = (
+        price
+        * (
+            1
+            - stop_distance
+        )
+    )
+
+    return {
+        "symbol": symbol,
+        "price": price,
+
+        "sma": sma_value,
+        "ema": ema_value,
+        "rsi": rsi_value,
+
+        "atr": atr_value,
+        "atr_percent": atr_percent,
+
+        "average_volume": average_volume,
+        "current_volume": current_volume,
+
+        "relative_strength": (
+            relative_strength
+            if relative_strength is not None
+            else 0.0
+        ),
+
+        "trend_score": trend_score,
+        "rsi_score": rsi_score,
+        "momentum_score": momentum_score,
+        "volume_score": volume_score,
+        "relative_score": relative_score,
+        "volatility_score": volatility_score,
+
+        "score": total_score,
+
+        "bullish_trend": bullish_trend,
+        "valid_rsi": valid_rsi,
+        "positive_relative_strength": (
+            positive_relative_strength
+        ),
+        "enough_volume": enough_volume,
+
+        "buy_signal": buy_signal,
+
+        "stop_price": stop_price,
+        "stop_distance": stop_distance
+    }
+
+
+# ============================================================
+# IMPRIMIR ANÁLISIS
+# ============================================================
+
+def print_analysis(
+    analysis
+):
+
+    symbol = analysis["symbol"]
+    score = analysis["score"]
+    price = analysis["price"]
+    rsi_value = analysis["rsi"]
+
+    relative = (
+        analysis["relative_strength"]
+        * 100
+    )
+
+    stop_distance = (
+        analysis["stop_distance"]
+        * 100
+    )
+
+    if analysis["buy_signal"]:
+
+        status = (
+            GREEN
+            + "COMPRABLE"
+            + RESET
+        )
+
+    else:
+
+        status = (
+            YELLOW
+            + "ESPERAR"
+            + RESET
+        )
+
+    print(
+        f"{symbol:<6} "
+        f"Score {score:>3}/100 | "
+        f"${price:>9.2f} | "
+        f"RSI {rsi_value:>5.1f} | "
+        f"RS {relative:>6.2f}% | "
+        f"Stop {stop_distance:>5.2f}% | "
+        f"{status}"
+    )
+
+
+# ============================================================
+# CONSTRUIR POSICIONES PARA RISK MANAGER
+# ============================================================
+
+def build_risk_positions(
+    positions,
+    db_events
+):
+
+    result = []
+
+    for symbol, position in positions.items():
+
+        event = db_events.get(
+            symbol
+        )
+
+        if event is None:
+
+            # Posición existente pero sin stop
+            # conocido por nuestra estrategia.
+            #
+            # No inventamos un riesgo.
+            # La marcamos como desconocida.
+
+            result.append({
+                "position_size": position["qty"],
+                "entry_price": position[
+                    "avg_entry_price"
+                ],
+                "stop_price": 0.0,
+                "risk_unknown": True
+            })
+
+            continue
+
+        result.append({
+            "position_size": position["qty"],
+            "entry_price": event[
+                "entry_price"
+            ],
+            "stop_price": event[
+                "stop_price"
+            ],
+            "risk_unknown": False
+        })
+
+    return result
+
+
+# ============================================================
+# OBTENER EVENTOS ABIERTOS DE LA BASE
+# ============================================================
+
+def load_db_position_events(
+    positions
+):
+
+    result = {}
+
+    for symbol in positions:
+
+        try:
+
+            event = get_open_position_event(
+                symbol
             )
-            return None
 
-        current_price = closes[-1]
+            if event:
 
-        sma20 = sma(closes, 20)
-        ema20 = ema(closes, 20)
-        rsi14 = rsi(closes, 14)
-        vol20 = volatility(closes, 20)
+                result[symbol] = event
 
-        if (
-            sma20 is None
-            or ema20 is None
-            or rsi14 is None
-            or vol20 is None
-        ):
-            print(f"{symbol}: INDICADORES INCOMPLETOS")
-            return None
+        except Exception:
 
-        # ====================================================
-        # ESTRATEGIA V2
-        # ====================================================
+            pass
 
-        if current_price > ema20 and rsi14 < 70:
-            signal = "COMPRAR"
+    return result
 
-        elif current_price < ema20 and rsi14 > 30:
-            signal = "VENDER"
 
-        else:
-            signal = "ESPERAR"
+# ============================================================
+# RIESGO DE CARTERA
+# ============================================================
 
-        # ====================================================
-        # SCORE
-        # ====================================================
+def calculate_current_portfolio_risk_safe(
+    account_value,
+    positions,
+    db_events
+):
 
-        score = 0
+    if not positions:
 
-        if current_price > ema20:
-            score += 1
+        return 0.0, False
 
-        if current_price > sma20:
-            score += 1
+    risk_positions = []
 
-        if ema20 > sma20:
-            score += 1
+    unknown_stop = False
 
-        if 40 <= rsi14 < 65:
-            score += 1
+    for symbol, position in positions.items():
 
-        if signal == "COMPRAR":
-            score += 1
+        event = db_events.get(
+            symbol
+        )
 
-        return {
-            "symbol": symbol,
-            "price": current_price,
-            "sma20": sma20,
-            "ema20": ema20,
-            "rsi14": rsi14,
-            "vol20": vol20,
-            "signal": signal,
-            "score": score
-        }
+        if event is None:
+
+            unknown_stop = True
+
+            continue
+
+        stop_price = safe_float(
+            event.get(
+                "stop_price",
+                0
+            )
+        )
+
+        if stop_price <= 0:
+
+            unknown_stop = True
+
+            continue
+
+        risk_positions.append({
+            "position_size": position["qty"],
+            "entry_price": position[
+                "avg_entry_price"
+            ],
+            "stop_price": stop_price
+        })
+
+    if unknown_stop:
+
+        # Seguridad:
+        # si no sabemos el riesgo real de alguna
+        # posición, no permitimos asumir que es 0.
+
+        return (
+            MAX_PORTFOLIO_RISK,
+            True
+        )
+
+    risk = calculate_portfolio_risk(
+        account_value,
+        risk_positions
+    )
+
+    return (
+        risk,
+        False
+    )
+
+
+# ============================================================
+# EXPOSICIÓN ACTUAL
+# ============================================================
+
+def calculate_current_exposure(
+    account_value,
+    positions
+):
+
+    if account_value <= 0:
+
+        return 1.0
+
+    total_market_value = 0.0
+
+    for position in positions.values():
+
+        market_value = abs(
+            safe_float(
+                position["market_value"]
+            )
+        )
+
+        total_market_value += (
+            market_value
+        )
+
+    return (
+        total_market_value
+        / account_value
+    )
+
+
+# ============================================================
+# REGISTRAR RECHAZO
+# ============================================================
+
+def log_rejection(
+    symbol,
+    analysis,
+    reason
+):
+
+    try:
+
+        log_event(
+            symbol=symbol,
+            signal="COMPRAR",
+            entry_price=analysis.get(
+                "price",
+                0
+            ),
+            stop_price=analysis.get(
+                "stop_price",
+                0
+            ),
+            position_size=0,
+            status="REJECTED",
+            profit_loss=0.0
+        )
 
     except Exception as error:
 
         print(
-            f"{symbol}: ERROR DURANTE ANALISIS"
+            RED
+            + f"[DB] Error registrando rechazo: {error}"
+            + RESET
         )
-        print(str(error))
 
-        return None
+    print(
+        RED
+        + f"[RECHAZADO] {symbol} -> {reason}"
+        + RESET
+    )
+
+
+# ============================================================
+# CLIENT ORDER ID
+# ============================================================
+
+def create_client_order_id(
+    symbol
+):
+
+    timestamp = int(
+        time.time()
+        * 1000
+    )
+
+    return (
+        f"AI_V3_{symbol}_{timestamp}"
+    )[:128]
+
+
+# ============================================================
+# ENVIAR ORDEN
+# ============================================================
+
+def submit_trade(
+    trading_client,
+    symbol,
+    quantity,
+    stop_price
+):
+
+    client_order_id = create_client_order_id(
+        symbol
+    )
+
+    order_request = MarketOrderRequest(
+        symbol=symbol,
+        qty=quantity,
+        side=OrderSide.BUY,
+        time_in_force=TimeInForce.DAY,
+        order_class=OrderClass.OTO,
+        stop_loss=StopLossRequest(
+            stop_price=round(
+                stop_price,
+                2
+            )
+        ),
+        client_order_id=client_order_id
+    )
+
+    order = trading_client.submit_order(
+        order_data=order_request
+    )
+
+    return (
+        order,
+        client_order_id
+    )
 
 
 # ============================================================
@@ -196,771 +1418,1075 @@ def analyze_symbol(data_client, symbol):
 
 def main():
 
-    # ========================================================
-    # BASE DE DATOS
-    # ========================================================
+    print_header()
 
     initialize_database()
 
-    # ========================================================
-    # CREDENCIALES
-    # ========================================================
+    # --------------------------------------------------------
+    # CLIENTES
+    # --------------------------------------------------------
 
-    api_key = os.getenv("APCA_API_KEY_ID")
-    secret_key = os.getenv("APCA_API_SECRET_KEY")
+    try:
 
-    if not api_key or not secret_key:
-
-        raise RuntimeError(
-            "FALTAN APCA_API_KEY_ID O APCA_API_SECRET_KEY "
-            "EN RAILWAY"
+        trading_client, data_client = (
+            create_clients()
         )
 
-    # ========================================================
-    # CONEXIÓN ALPACA
-    # ========================================================
+    except Exception as error:
 
-    trading_client = TradingClient(
-        api_key,
-        secret_key,
-        paper=True
-    )
-
-    data_client = StockHistoricalDataClient(
-        api_key,
-        secret_key
-    )
-
-    account = trading_client.get_account()
-
-    account_value = float(account.equity)
-
-    print()
-    print("================================================")
-    print("          AI TRADER V2 — PAPER")
-    print("================================================")
-    print()
-    print("CONEXION CON ALPACA: OK")
-    print(f"Cuenta: {account.status}")
-    print(f"Capital: ${account_value:,.2f}")
-    print("MODO: PAPER")
-    print()
-    print(f"Activos monitoreados: {len(SYMBOLS)}")
-    print()
-
-    # ========================================================
-    # ESTADO DEL BOT
-    # ========================================================
-
-    trades_today = get_today_trade_count()
-    daily_loss = get_today_loss()
-    today_profit_loss = get_today_profit_loss()
-
-    print("=== ESTADO DEL BOT ===")
-    print(
-        f"Fecha UTC: "
-        f"{datetime.now(timezone.utc).date()}"
-    )
-    print(
-        f"Operaciones ejecutadas hoy: "
-        f"{trades_today}"
-    )
-    print(
-        f"Perdida diaria: "
-        f"${daily_loss:.2f}"
-    )
-    print(
-        f"Resultado del dia: "
-        f"${today_profit_loss:.2f}"
-    )
-    print()
-
-    # ========================================================
-    # ESTADO DEL MERCADO
-    # ========================================================
-
-    clock = trading_client.get_clock()
-
-    print("=== ESTADO DEL MERCADO ===")
-    print(f"Mercado abierto: {clock.is_open}")
-
-    if not clock.is_open:
-
-        print(f"Proxima apertura: {clock.next_open}")
-        print(f"Proximo cierre: {clock.next_close}")
-        print()
-        print("MERCADO CERRADO")
-        print("NO SE ENVIARA NINGUNA ORDEN")
-        print("================================================")
+        print(
+            RED
+            + f"ERROR DE CONEXIÓN: {error}"
+            + RESET
+        )
 
         return
 
-    print()
+    # --------------------------------------------------------
+    # CUENTA
+    # --------------------------------------------------------
 
-    # ========================================================
-    # POSICIONES EXISTENTES
-    # ========================================================
+    try:
 
-    print("================================================")
-    print("        SINCRONIZACION DE POSICIONES")
-    print("================================================")
-
-    positions = trading_client.get_all_positions()
-
-    open_symbols = set()
-
-    for position in positions:
-
-        symbol = position.symbol
-
-        open_symbols.add(symbol)
-
-        qty = int(float(position.qty))
-        avg_entry = float(position.avg_entry_price)
-        current_price = float(position.current_price)
-        unrealized_pl = float(position.unrealized_pl)
-
-        print()
-        print(f"POSICION: {symbol}")
-        print(f"Cantidad: {qty}")
-        print(f"Precio promedio: ${avg_entry:.2f}")
-        print(f"Precio actual: ${current_price:.2f}")
-        print(f"P/L no realizado: ${unrealized_pl:.2f}")
-
-        # ====================================================
-        # SINCRONIZAR DB
-        # ====================================================
-
-        db_position = get_open_position_event(symbol)
-
-        if db_position is None:
-
-            print(
-                "Posicion no encontrada en DB."
-            )
-            print("SINCRONIZANDO...")
-
-            synced_event_id = log_event(
-                symbol=symbol,
-                signal="COMPRAR",
-                entry_price=avg_entry,
-                stop_price=0.0,
-                position_size=qty,
-                status="POSITION_OPEN",
-                profit_loss=0.0,
-                order_id=None,
-                client_order_id=None
-            )
-
-            print(
-                f"Posicion sincronizada "
-                f"Evento DB: #{synced_event_id}"
-            )
-
-        else:
-
-            print(
-                f"DB: posicion registrada "
-                f"#{db_position['id']}"
-            )
-
-    if not open_symbols:
-
-        print("No existen posiciones abiertas.")
-
-    print()
-
-    # ========================================================
-    # ORDENES PENDIENTES
-    # ========================================================
-
-    print("================================================")
-    print("          ORDENES PENDIENTES")
-    print("================================================")
-
-    open_orders_request = GetOrdersRequest(
-        status=QueryOrderStatus.OPEN,
-        limit=50,
-        nested=True
-    )
-
-    open_orders = trading_client.get_orders(
-        filter=open_orders_request
-    )
-
-    pending_symbols = set()
-
-    for order in open_orders:
-
-        pending_symbols.add(order.symbol)
-
-        print(
-            f"{order.symbol} | "
-            f"ID: {order.id} | "
-            f"Estado: {order.status}"
+        account = get_account_snapshot(
+            trading_client
         )
 
-    if not pending_symbols:
+    except Exception as error:
 
-        print("No existen ordenes pendientes.")
+        print(
+            RED
+            + f"ERROR OBTENIENDO CUENTA: {error}"
+            + RESET
+        )
+
+        return
+
+    equity = account["equity"]
+    buying_power = account["buying_power"]
+
+    print(
+        CYAN
+        + "=== CUENTA ==="
+        + RESET
+    )
+
+    print(
+        f"Equity:       ${equity:,.2f}"
+    )
+
+    print(
+        f"Buying Power: ${buying_power:,.2f}"
+    )
+
+    print(
+        f"Cash:         ${account['cash']:,.2f}"
+    )
+
+    print(
+        f"Estado:       {account['status']}"
+    )
 
     print()
 
-    # ========================================================
-    # CAPACIDAD DE NUEVAS POSICIONES
-    # ========================================================
+    if equity <= 0:
+
+        print(
+            RED
+            + "CUENTA INVÁLIDA"
+            + RESET
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # MERCADO
+    # --------------------------------------------------------
+
+    try:
+
+        market_open, clock = check_market(
+            trading_client
+        )
+
+    except Exception as error:
+
+        print(
+            RED
+            + f"ERROR REVISANDO MERCADO: {error}"
+            + RESET
+        )
+
+        return
+
+    if not market_open:
+
+        print(
+            YELLOW
+            + "MERCADO CERRADO — NO SE OPERARÁ"
+            + RESET
+        )
+
+        return
+
+    print(
+        GREEN
+        + "MERCADO ABIERTO"
+        + RESET
+    )
+
+    print()
+
+    # --------------------------------------------------------
+    # MÉTRICAS DEL DÍA
+    # --------------------------------------------------------
+
+    trades_today = get_today_trade_count()
+    daily_loss = get_today_loss()
+    daily_profit_loss = get_today_profit_loss()
+
+    print(
+        CYAN
+        + "=== ESTADO DEL DÍA ==="
+        + RESET
+    )
+
+    print(
+        f"Operaciones: {trades_today}"
+    )
+
+    print(
+        f"Pérdida acumulada: ${daily_loss:,.2f}"
+    )
+
+    print(
+        f"P/L cerrado: ${daily_profit_loss:,.2f}"
+    )
+
+    print()
+
+    daily_limit = (
+        equity
+        * MAX_DAILY_LOSS
+    )
+
+    if daily_loss >= daily_limit:
+
+        print(
+            RED
+            + "KILL SWITCH: LÍMITE DE PÉRDIDA DIARIA"
+            + RESET
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # POSICIONES
+    # --------------------------------------------------------
+
+    try:
+
+        positions = get_positions(
+            trading_client
+        )
+
+    except Exception as error:
+
+        print(
+            RED
+            + f"ERROR OBTENIENDO POSICIONES: {error}"
+            + RESET
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # ÓRDENES
+    # --------------------------------------------------------
+
+    try:
+
+        open_orders = get_open_orders(
+            trading_client
+        )
+
+    except Exception as error:
+
+        print(
+            RED
+            + f"ERROR OBTENIENDO ÓRDENES: {error}"
+            + RESET
+        )
+
+        return
+
+    print(
+        CYAN
+        + "=== CARTERA ==="
+        + RESET
+    )
+
+    print(
+        f"Posiciones abiertas: "
+        f"{len(positions)}"
+    )
+
+    print(
+        f"Símbolos con órdenes: "
+        f"{len(open_orders)}"
+    )
+
+    print()
+
+    # --------------------------------------------------------
+    # LÍMITE DE POSICIONES
+    # --------------------------------------------------------
 
     available_slots = (
-        MAX_NEW_POSITIONS_PER_CYCLE
-        - len(open_symbols)
+        MAX_OPEN_POSITIONS
+        - len(positions)
     )
 
     if available_slots <= 0:
 
-        print("================================================")
-        print("LIMITE DE POSICIONES ALCANZADO")
-        print("NO SE BUSCARAN NUEVAS ENTRADAS")
-        print("================================================")
+        print(
+            YELLOW
+            + "No hay espacio para nuevas posiciones."
+            + RESET
+        )
 
         return
 
-    # ========================================================
-    # ESCANEO DE LOS 25 ACTIVOS
-    # ========================================================
+    max_entries = min(
+        available_slots,
+        MAX_NEW_POSITIONS_PER_CYCLE
+    )
 
-    print("================================================")
-    print("             ESCANEO MULTI-ACTIVO")
-    print("================================================")
+    # --------------------------------------------------------
+    # EVENTOS DB
+    # --------------------------------------------------------
+
+    db_events = load_db_position_events(
+        positions
+    )
+
+    # --------------------------------------------------------
+    # RIESGO ACTUAL
+    # --------------------------------------------------------
+
+    current_portfolio_risk, unknown_stop = (
+        calculate_current_portfolio_risk_safe(
+            equity,
+            positions,
+            db_events
+        )
+    )
+
+    current_exposure = (
+        calculate_current_exposure(
+            equity,
+            positions
+        )
+    )
+
+    print(
+        CYAN
+        + "=== RIESGO ACTUAL ==="
+        + RESET
+    )
+
+    print(
+        f"Riesgo cartera: "
+        f"{current_portfolio_risk * 100:.2f}%"
+    )
+
+    print(
+        f"Exposición: "
+        f"{current_exposure * 100:.2f}%"
+    )
+
+    if unknown_stop:
+
+        print(
+            YELLOW
+            + "ADVERTENCIA: "
+              "hay posiciones cuyo stop no pudo "
+              "ser reconstruido."
+            + RESET
+        )
+
+        print(
+            YELLOW
+            + "El sistema tratará el riesgo "
+              "como conservador."
+            + RESET
+        )
+
     print()
 
-    candidates = []
+    if current_exposure >= MAX_TOTAL_EXPOSURE:
+
+        print(
+            RED
+            + "EXPOSICIÓN MÁXIMA ALCANZADA."
+            + RESET
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # DESCARGAR SPY
+    # --------------------------------------------------------
+
+    print(
+        CYAN
+        + "=== PREPARANDO BENCHMARK ==="
+        + RESET
+    )
+
+    try:
+
+        benchmark_bars = get_daily_bars(
+            data_client,
+            BENCHMARK
+        )
+
+    except Exception as error:
+
+        print(
+            RED
+            + f"ERROR DESCARGANDO SPY: {error}"
+            + RESET
+        )
+
+        return
+
+    if len(benchmark_bars) < MIN_BARS:
+
+        print(
+            RED
+            + "No hay suficientes datos de SPY."
+            + RESET
+        )
+
+        return
+
+    print(
+        GREEN
+        + f"SPY listo: {len(benchmark_bars)} barras"
+        + RESET
+    )
+
+    print()
+
+    # --------------------------------------------------------
+    # ESCÁNER
+    # --------------------------------------------------------
+
+    print(
+        CYAN
+        + "=== ESCÁNER MULTI-ACTIVO ==="
+        + RESET
+    )
+
+    analyses = []
 
     for symbol in SYMBOLS:
 
-        print(f"Analizando {symbol}...")
+        if symbol == BENCHMARK:
 
-        # ----------------------------------------------------
-        # Si ya tiene posición
-        # ----------------------------------------------------
-
-        if symbol in open_symbols:
-
-            print(
-                f"{symbol}: POSICION ABIERTA "
-                f"-> NO SE COMPRA"
-            )
-            print()
             continue
 
         # ----------------------------------------------------
-        # Si tiene orden pendiente
+        # NO TOCAR POSICIONES EXISTENTES
         # ----------------------------------------------------
 
-        if symbol in pending_symbols:
+        if symbol_is_locked(
+            symbol,
+            positions,
+            open_orders
+        ):
 
             print(
-                f"{symbol}: ORDEN PENDIENTE "
-                f"-> NO SE ENVIA OTRA"
+                YELLOW
+                + f"{symbol:<6} BLOQUEADO "
+                  "(posición/orden existente)"
+                + RESET
             )
-            print()
+
             continue
 
-        # ----------------------------------------------------
-        # Analizar
-        # ----------------------------------------------------
+        try:
 
-        result = analyze_symbol(
-            data_client,
-            symbol
-        )
-
-        if result is None:
-
-            print()
-            continue
-
-        print(
-            f"Precio: ${result['price']:.2f}"
-        )
-
-        print(
-            f"EMA20: ${result['ema20']:.2f}"
-        )
-
-        print(
-            f"SMA20: ${result['sma20']:.2f}"
-        )
-
-        print(
-            f"RSI14: {result['rsi14']:.2f}"
-        )
-
-        print(
-            f"Score: {result['score']}/5"
-        )
-
-        print(
-            f"Señal: {result['signal']}"
-        )
-
-        # ----------------------------------------------------
-        # Solo candidatos LONG
-        # ----------------------------------------------------
-
-        if result["signal"] == "COMPRAR":
-
-            candidates.append(result)
-
-            print(
-                ">>> CANDIDATO DE COMPRA"
+            bars = get_daily_bars(
+                data_client,
+                symbol
             )
 
-        else:
-
-            print(
-                "No hay entrada."
+            time.sleep(
+                REQUEST_DELAY
             )
 
-        print()
+            analysis = analyze_symbol(
+                symbol,
+                bars,
+                benchmark_bars
+            )
 
-    # ========================================================
-    # RESULTADO DEL ESCANEO
-    # ========================================================
+            if analysis is None:
 
-    print("================================================")
-    print("          RESULTADO DEL ESCANEO")
-    print("================================================")
+                print(
+                    YELLOW
+                    + f"{symbol:<6} "
+                      "datos insuficientes/filtro"
+                    + RESET
+                )
+
+                continue
+
+            analyses.append(
+                analysis
+            )
+
+            print_analysis(
+                analysis
+            )
+
+        except Exception as error:
+
+            print(
+                RED
+                + f"{symbol:<6} ERROR: {error}"
+                + RESET
+            )
+
+    print()
+
+    # --------------------------------------------------------
+    # RANKING
+    # --------------------------------------------------------
+
+    analyses.sort(
+        key=lambda item: (
+            item["score"],
+            item["relative_strength"],
+            item["momentum_score"]
+        ),
+        reverse=True
+    )
+
+    print(
+        MAGENTA
+        + "=== RANKING DE OPORTUNIDADES ==="
+        + RESET
+    )
+
+    if not analyses:
+
+        print(
+            YELLOW
+            + "No se encontraron oportunidades."
+            + RESET
+        )
+
+        return
+
+    for index, analysis in enumerate(
+        analyses[:10],
+        start=1
+    ):
+
+        print(
+            f"{index:>2}. "
+            f"{analysis['symbol']:<6} "
+            f"Score {analysis['score']:>3}/100 | "
+            f"RSI {analysis['rsi']:>5.1f} | "
+            f"RS "
+            f"{analysis['relative_strength'] * 100:>6.2f}%"
+        )
+
+    print()
+
+    # --------------------------------------------------------
+    # CANDIDATOS
+    # --------------------------------------------------------
+
+    candidates = [
+        item
+        for item in analyses
+        if item["buy_signal"]
+    ]
 
     if not candidates:
 
         print(
-            "No se encontraron oportunidades "
-            "de compra."
+            YELLOW
+            + "Ningún activo pasó todos los filtros."
+            + RESET
         )
-        print()
-        print(
-            "El bot NO enviara ninguna orden."
-        )
-        print("================================================")
 
         return
 
-    # ========================================================
-    # ORDENAR CANDIDATOS
-    # ========================================================
-
-    candidates.sort(
-        key=lambda item: item["score"],
-        reverse=True
-    )
-
-    print()
     print(
-        f"Oportunidades encontradas: "
-        f"{len(candidates)}"
-    )
-    print()
-
-    for candidate in candidates:
-
-        print(
-            f"{candidate['symbol']} | "
-            f"Score {candidate['score']}/5 | "
-            f"RSI {candidate['rsi14']:.2f}"
-        )
-
-    print()
-
-    # ========================================================
-    # LIMITAR ENTRADAS
-    # ========================================================
-
-    selected_candidates = candidates[
-        :available_slots
-    ]
-
-    print(
-        f"Candidatos seleccionados: "
-        f"{len(selected_candidates)}"
+        GREEN
+        + f"Candidatos válidos: {len(candidates)}"
+        + RESET
     )
 
     print()
 
-    # ========================================================
-    # EJECUTAR CANDIDATOS
-    # ========================================================
+    # --------------------------------------------------------
+    # EJECUCIÓN
+    # --------------------------------------------------------
 
-    executed_count = 0
+    executed = 0
 
-    for candidate in selected_candidates:
+    for analysis in candidates:
 
-        symbol = candidate["symbol"]
-        current_price = candidate["price"]
+        if executed >= max_entries:
+
+            break
+
+        symbol = analysis["symbol"]
 
         print()
-        print("================================================")
         print(
-            f"          PROCESANDO {symbol}"
-        )
-        print("================================================")
-
-        # ====================================================
-        # STOP LOSS
-        # ====================================================
-
-        stop_price = round(
-            current_price * 0.97,
-            2
+            "=" * 72
         )
 
         print(
-            f"Entrada referencia: "
-            f"${current_price:.2f}"
+            MAGENTA
+            + f"ANALIZANDO ENTRADA: {symbol}"
+            + RESET
         )
 
         print(
-            f"Stop loss: "
-            f"${stop_price:.2f}"
-        )
-
-        # ====================================================
-        # RISK MANAGER
-        # ====================================================
-
-        approved, message = risk_check(
-            signal="COMPRAR",
-            account_value=account_value,
-            entry_price=current_price,
-            stop_price=stop_price,
-            daily_loss=daily_loss,
-            trades_today=trades_today
+            f"Score:          {analysis['score']}/100"
         )
 
         print(
-            f"Autorizacion: {approved}"
+            f"Precio:         ${analysis['price']:.2f}"
         )
 
-        print(message)
+        print(
+            f"RSI:            {analysis['rsi']:.2f}"
+        )
 
-        if not approved:
+        print(
+            f"ATR:            ${analysis['atr']:.2f}"
+        )
 
-            print(
-                f"{symbol}: RISK MANAGER "
-                f"RECHAZO LA OPERACION"
-            )
+        print(
+            f"Stop:           ${analysis['stop_price']:.2f}"
+        )
 
-            continue
+        print(
+            f"Distancia stop: "
+            f"{analysis['stop_distance'] * 100:.2f}%"
+        )
 
-        # ====================================================
-        # POSITION SIZE
-        # ====================================================
+        # ----------------------------------------------------
+        # POSICIÓN
+        # ----------------------------------------------------
 
         position_size = calculate_position_size(
-            account_value=account_value,
-            entry_price=current_price,
-            stop_price=stop_price
+            account_value=equity,
+            entry_price=analysis["price"],
+            stop_price=analysis["stop_price"],
+            risk_percent=MAX_RISK_PER_TRADE,
+            buying_power=buying_power
         )
 
         if position_size <= 0:
 
-            print(
-                f"{symbol}: TAMAÑO DE POSICION INVALIDO"
+            log_rejection(
+                symbol,
+                analysis,
+                "TAMAÑO DE POSICIÓN INVÁLIDO"
             )
 
             continue
 
-        print()
-        print("=== POSICION ===")
-        print(
-            f"Acciones: {position_size}"
-        )
-        print(
-            f"Riesgo por accion: "
-            f"${abs(current_price - stop_price):.2f}"
+        position_value = calculate_position_value(
+            position_size,
+            analysis["price"]
         )
 
-        # ====================================================
-        # CLIENT ORDER ID
-        # ====================================================
-
-        client_order_id = (
-            f"ai-trader-{symbol.lower()}-"
-            f"{uuid.uuid4().hex[:12]}"
+        trade_risk = calculate_trade_risk(
+            position_size,
+            analysis["price"],
+            analysis["stop_price"]
         )
 
-        # ====================================================
-        # ORDEN PAPER
-        # ====================================================
-
-        print()
-        print("=== EJECUCION PAPER ===")
-        print(
-            f"COMPRA {position_size} {symbol}"
-        )
-        print(
-            f"Stop loss: ${stop_price:.2f}"
-        )
-        print(
-            "Enviando orden a Alpaca Paper..."
-        )
-
-        order_request = MarketOrderRequest(
-            symbol=symbol,
-            qty=position_size,
-            side=OrderSide.BUY,
-            time_in_force=TimeInForce.DAY,
-            order_class=OrderClass.OTO,
-            stop_loss=StopLossRequest(
-                stop_price=stop_price
-            ),
-            client_order_id=client_order_id
-        )
-
-        # ====================================================
-        # ENVIAR ORDEN
-        # ====================================================
-
-        try:
-
-            order = trading_client.submit_order(
-                order_data=order_request
+        trade_risk_percent = (
+            calculate_trade_risk_percent(
+                equity,
+                position_size,
+                analysis["price"],
+                analysis["stop_price"]
             )
+        )
 
-        except Exception as error:
+        print(
+            f"Acciones:       {position_size}"
+        )
 
-            print()
-            print("ERROR AL ENVIAR ORDEN")
-            print(str(error))
-            print(
-                f"{symbol}: NO SE REGISTRA "
-                "COMO EJECUTADA"
+        print(
+            f"Capital:        ${position_value:,.2f}"
+        )
+
+        print(
+            f"Riesgo:         ${trade_risk:,.2f}"
+        )
+
+        print(
+            f"Riesgo %:       "
+            f"{trade_risk_percent * 100:.2f}%"
+        )
+
+        # ----------------------------------------------------
+        # BUYING POWER
+        # ----------------------------------------------------
+
+        if position_value > buying_power:
+
+            log_rejection(
+                symbol,
+                analysis,
+                "BUYING POWER INSUFICIENTE"
             )
 
             continue
 
-        # ====================================================
-        # REGISTRAR EN DATABASE
-        # ====================================================
+        # ----------------------------------------------------
+        # EXPOSICIÓN DEL SÍMBOLO
+        # ----------------------------------------------------
 
-        order_id = str(order.id)
+        symbol_ok, symbol_message = (
+            symbol_exposure_check(
+                account_value=equity,
+                symbol=symbol,
+                position_size=position_size,
+                entry_price=analysis["price"],
+                existing_symbol_value=0.0
+            )
+        )
 
-        event_id = log_event(
-            symbol=symbol,
+        if not symbol_ok:
+
+            log_rejection(
+                symbol,
+                analysis,
+                symbol_message
+            )
+
+            continue
+
+        # ----------------------------------------------------
+        # PORTFOLIO CHECK
+        # ----------------------------------------------------
+
+        portfolio_risk_check_ok = (
+            current_portfolio_risk
+            + trade_risk_percent
+            <= MAX_PORTFOLIO_RISK
+        )
+
+        projected_exposure = (
+            current_exposure
+            + (
+                position_value
+                / equity
+            )
+        )
+
+        if not portfolio_risk_check_ok:
+
+            log_rejection(
+                symbol,
+                analysis,
+                "RIESGO TOTAL DE CARTERA EXCEDIDO"
+            )
+
+            continue
+
+        if projected_exposure > MAX_TOTAL_EXPOSURE:
+
+            log_rejection(
+                symbol,
+                analysis,
+                "EXPOSICIÓN TOTAL EXCEDIDA"
+            )
+
+            continue
+
+        # ----------------------------------------------------
+        # RISK MANAGER V3
+        # ----------------------------------------------------
+
+        approved, risk_message = risk_check(
             signal="COMPRAR",
-            entry_price=current_price,
-            stop_price=stop_price,
-            position_size=position_size,
-            status="ORDER_SUBMITTED",
-            profit_loss=0.0,
-            order_id=order_id,
-            client_order_id=client_order_id
-        )
 
-        print()
-        print("================================================")
-        print("             ORDEN PAPER ENVIADA")
-        print("================================================")
+            account_value=equity,
 
-        print(
-            f"Evento DB: #{event_id}"
-        )
+            entry_price=analysis["price"],
 
-        print(
-            f"Order ID: {order.id}"
-        )
+            stop_price=analysis["stop_price"],
 
-        print(
-            f"Estado: {order.status}"
-        )
+            daily_loss=daily_loss,
 
-        print(
-            f"Simbolo: {order.symbol}"
+            trades_today=trades_today,
+
+            current_portfolio_risk=(
+                current_portfolio_risk
+            ),
+
+            open_positions=len(
+                positions
+            ),
+
+            current_exposure=current_exposure,
+
+            buying_power=buying_power,
+
+            existing_symbol_value=0.0
         )
 
         print(
-            f"Cantidad: {order.qty}"
+            f"Risk Manager: {risk_message}"
         )
 
-        print(
-            f"Lado: {order.side}"
-        )
+        if not approved:
 
-        print(
-            f"Stop loss: ${stop_price:.2f}"
-        )
+            log_rejection(
+                symbol,
+                analysis,
+                risk_message
+            )
 
-        print(
-            f"Client Order ID: "
-            f"{client_order_id}"
-        )
+            continue
 
-        # ====================================================
-        # VERIFICAR ORDEN
-        # ====================================================
+        # ----------------------------------------------------
+        # ÚLTIMA COMPROBACIÓN
+        # ----------------------------------------------------
 
         try:
 
-            updated_order = (
-                trading_client.get_order_by_id(
-                    order.id
-                )
+            fresh_positions = get_positions(
+                trading_client
             )
 
-            order_status = (
-                str(updated_order.status)
-                .upper()
+            fresh_orders = get_open_orders(
+                trading_client
             )
-
-            print()
-            print("=== VERIFICACION DE ORDEN ===")
-            print(
-                f"Estado actual: "
-                f"{order_status}"
-            )
-
-            if order_status == "FILLED":
-
-                filled_price = (
-                    float(
-                        updated_order.filled_avg_price
-                    )
-                    if updated_order.filled_avg_price
-                    else current_price
-                )
-
-                filled_qty = (
-                    int(
-                        float(
-                            updated_order.filled_qty
-                        )
-                    )
-                    if updated_order.filled_qty
-                    else position_size
-                )
-
-                update_event(
-                    event_id=event_id,
-                    status="FILLED",
-                    order_id=order_id,
-                    client_order_id=client_order_id
-                )
-
-                print(
-                    f"Precio ejecutado: "
-                    f"${filled_price:.2f}"
-                )
-
-                print(
-                    f"Cantidad ejecutada: "
-                    f"{filled_qty}"
-                )
-
-                print(
-                    "DATABASE: FILLED"
-                )
-
-            elif order_status in [
-                "CANCELED",
-                "EXPIRED",
-                "REJECTED"
-            ]:
-
-                update_event(
-                    event_id=event_id,
-                    status=order_status,
-                    order_id=order_id,
-                    client_order_id=client_order_id
-                )
-
-                print(
-                    f"DATABASE: "
-                    f"{order_status}"
-                )
-
-            else:
-
-                print(
-                    "La orden aun no tiene "
-                    "estado final."
-                )
-
-                print(
-                    "DATABASE: ORDER_SUBMITTED"
-                )
 
         except Exception as error:
 
-            print()
-            print(
-                "NO SE PUDO VERIFICAR "
-                "EL ESTADO DE LA ORDEN"
+            log_rejection(
+                symbol,
+                analysis,
+                f"ERROR DE SINCRONIZACIÓN: {error}"
             )
 
-            print(str(error))
+            continue
 
-        executed_count += 1
+        if symbol_is_locked(
+            symbol,
+            fresh_positions,
+            fresh_orders
+        ):
 
-        # ====================================================
+            log_rejection(
+                symbol,
+                analysis,
+                "EL ACTIVO SE BLOQUEÓ DURANTE EL CICLO"
+            )
+
+            continue
+
+        # ----------------------------------------------------
+        # EJECUTAR
+        # ----------------------------------------------------
+
+        print()
+        print(
+            GREEN
+            + f"🔥 AUTORIZADO: COMPRAR {symbol}"
+            + RESET
+        )
+
+        try:
+
+            order, client_order_id = submit_trade(
+                trading_client=trading_client,
+                symbol=symbol,
+                quantity=position_size,
+                stop_price=analysis["stop_price"]
+            )
+
+        except Exception as error:
+
+            print(
+                RED
+                + f"ERROR ENVIANDO ORDEN {symbol}: {error}"
+                + RESET
+            )
+
+            try:
+
+                log_event(
+                    symbol=symbol,
+                    signal="COMPRAR",
+                    entry_price=analysis["price"],
+                    stop_price=analysis["stop_price"],
+                    position_size=position_size,
+                    status="ORDER_ERROR",
+                    profit_loss=0.0,
+                    client_order_id=None
+                )
+
+            except Exception:
+
+                pass
+
+            continue
+
+        # ----------------------------------------------------
+        # REGISTRO
+        # ----------------------------------------------------
+
+        order_id = getattr(
+            order,
+            "id",
+            None
+        )
+
+        order_status = str(
+            getattr(
+                order,
+                "status",
+                "SUBMITTED"
+            )
+        )
+
+        try:
+
+            event_id = log_event(
+                symbol=symbol,
+                signal="COMPRAR",
+                entry_price=analysis["price"],
+                stop_price=analysis["stop_price"],
+                position_size=position_size,
+                status=order_status,
+                profit_loss=0.0,
+                order_id=order_id,
+                client_order_id=client_order_id
+            )
+
+        except Exception as error:
+
+            event_id = None
+
+            print(
+                RED
+                + f"ERROR GUARDANDO EVENTO DB: {error}"
+                + RESET
+            )
+
+        print()
+        print(
+            GREEN
+            + "================================================"
+            + RESET
+        )
+
+        print(
+            GREEN
+            + f"ORDEN ENVIADA: {symbol}"
+            + RESET
+        )
+
+        print(
+            f"Cantidad:       {position_size}"
+        )
+
+        print(
+            f"Precio aprox.:  ${analysis['price']:.2f}"
+        )
+
+        print(
+            f"Stop:           ${analysis['stop_price']:.2f}"
+        )
+
+        print(
+            f"Score:          {analysis['score']}/100"
+        )
+
+        print(
+            f"Order ID:       {order_id}"
+        )
+
+        print(
+            f"Client ID:      {client_order_id}"
+        )
+
+        print(
+            f"DB Event:       {event_id}"
+        )
+
+        print(
+            f"Estado:         {order_status}"
+        )
+
+        print(
+            GREEN
+            + "================================================"
+            + RESET
+        )
+
+        executed += 1
+
+        # ----------------------------------------------------
         # ACTUALIZAR CONTADORES LOCALES
-        # ====================================================
+        # ----------------------------------------------------
 
         trades_today += 1
 
-        # ----------------------------------------------------
-        # Seguridad adicional:
-        # no mandar más operaciones de las permitidas
-        # ----------------------------------------------------
+        current_portfolio_risk += (
+            trade_risk_percent
+        )
 
-        if trades_today >= 5:
+        current_exposure = projected_exposure
 
-            print()
-            print(
-                "LIMITE DIARIO DE OPERACIONES "
-                "ALCANZADO"
-            )
-
-            break
+        buying_power -= (
+            position_value
+        )
 
     # ========================================================
-    # RESULTADO FINAL
+    # RESUMEN FINAL
     # ========================================================
 
     print()
-    print("================================================")
-    print("              CICLO COMPLETADO")
-    print("================================================")
+    print("=" * 72)
 
     print(
-        f"Activos escaneados: "
-        f"{len(SYMBOLS)}"
+        CYAN
+        + "              RESUMEN DEL CICLO"
+        + RESET
+    )
+
+    print("=" * 72)
+
+    print(
+        f"Activos escaneados:     {len(SYMBOLS) - 1}"
     )
 
     print(
-        f"Oportunidades encontradas: "
-        f"{len(candidates)}"
+        f"Activos analizados:     {len(analyses)}"
     )
 
     print(
-        f"Ordenes procesadas: "
-        f"{executed_count}"
+        f"Candidatos:             {len(candidates)}"
     )
 
     print(
-        f"Operaciones del dia: "
-        f"{trades_today}"
+        f"Nuevas entradas:        {executed}"
+    )
+
+    print(
+        f"Posiciones actuales:    {len(positions) + executed}"
+    )
+
+    print(
+        f"Riesgo cartera aprox.:  "
+        f"{current_portfolio_risk * 100:.2f}%"
+    )
+
+    print(
+        f"Exposición aprox.:      "
+        f"{current_exposure * 100:.2f}%"
+    )
+
+    print(
+        f"Buying Power restante:   "
+        f"${buying_power:,.2f}"
     )
 
     print()
-    print(
-        "MODO PAPER — NO ES DINERO REAL"
-    )
 
-    print("================================================")
+    if executed == 0:
+
+        print(
+            YELLOW
+            + "El bot no abrió operaciones en este ciclo."
+            + RESET
+        )
+
+        print(
+            "Eso es correcto si ninguna oportunidad "
+            "cumplió los filtros."
+        )
+
+    else:
+
+        print(
+            GREEN
+            + f"El bot ejecutó {executed} nueva(s) entrada(s)."
+            + RESET
+        )
+
+    print()
+    print("=" * 72)
+    print("             AI TRADER V3 — CICLO TERMINADO")
+    print("=" * 72)
+    print()
 
 
 # ============================================================
-# EJECUTAR
+# EJECUCIÓN SEGURA
 # ============================================================
 
 if __name__ == "__main__":
-    main()
+
+    try:
+
+        main()
+
+    except KeyboardInterrupt:
+
+        print()
+        print(
+            YELLOW
+            + "Ejecución detenida manualmente."
+            + RESET
+        )
+
+    except Exception as error:
+
+        print()
+        print(
+            RED
+            + "================================================"
+            + RESET
+        )
+
+        print(
+            RED
+            + "KILL SWITCH — ERROR NO CONTROLADO"
+            + RESET
+        )
+
+        print(
+            RED
+            + str(error)
+            + RESET
+        )
+
+        print()
+        traceback.print_exc()
+
+        print(
+            RED
+            + "NO SE INTENTARÁN MÁS ÓRDENES."
+            + RESET
+        )
