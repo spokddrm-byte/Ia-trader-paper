@@ -896,3 +896,1095 @@ def cancel_symbol_orders(
             )
 
     return cancelled
+
+
+# ============================================================
+# SALIDA DE MERCADO
+# ============================================================
+
+
+def submit_exit_order(
+    trading_client,
+    symbol,
+    quantity,
+    reason
+):
+
+    quantity = safe_int(
+        quantity
+    )
+
+    if quantity <= 0:
+
+        return None
+
+    print()
+    print(
+        "================================================"
+    )
+
+    print(
+        f"[{symbol}] SALIDA AUTORIZADA"
+    )
+
+    print(
+        f"Razón: {reason}"
+    )
+
+    print(
+        f"Cantidad: {quantity}"
+    )
+
+    print(
+        "================================================"
+    )
+
+    order_request = MarketOrderRequest(
+        symbol=symbol,
+        qty=quantity,
+        side=OrderSide.SELL,
+        time_in_force=TimeInForce.DAY
+    )
+
+    order = (
+        trading_client
+        .submit_order(
+            order_data=order_request
+        )
+    )
+
+    return order
+
+
+# ============================================================
+# EVALUAR POSICIÓN
+# ============================================================
+
+
+def evaluate_position(
+    symbol,
+    position,
+    db_event,
+    indicators,
+    protective_orders
+):
+
+    current_price = safe_float(
+        position["current_price"]
+    )
+
+    entry_price = safe_float(
+        position["avg_entry_price"]
+    )
+
+    quantity = safe_float(
+        position["qty"]
+    )
+
+    if (
+        current_price <= 0
+        or entry_price <= 0
+        or quantity <= 0
+    ):
+
+        return {
+            "action": "HOLD",
+            "reason": "DATOS DE POSICIÓN INVÁLIDOS"
+        }
+
+    profit_percent = (
+        calculate_profit_percent(
+            entry_price,
+            current_price
+        )
+    )
+
+    original_stop = get_original_stop(
+        symbol,
+        db_event
+    )
+
+    atr = indicators["atr"]
+
+    trailing_stop = (
+        calculate_trailing_stop(
+            entry_price,
+            current_price,
+            atr
+        )
+    )
+
+    profit_protection = (
+        calculate_profit_protection(
+            entry_price,
+            current_price
+        )
+    )
+
+    # ========================================================
+    # 1. STOP ORIGINAL
+    # ========================================================
+
+    if (
+        original_stop is not None
+        and current_price <= original_stop
+    ):
+
+        return {
+            "action": "EXIT",
+            "reason": (
+                "PRECIO POR DEBAJO "
+                "DEL STOP ORIGINAL"
+            ),
+            "priority": 100
+        }
+
+    # ========================================================
+    # 2. PÉRDIDA EXTREMA
+    # ========================================================
+
+    if (
+        profit_percent
+        <= -EMERGENCY_LOSS_PERCENT
+    ):
+
+        return {
+            "action": "EXIT",
+            "reason": (
+                "PÉRDIDA DE EMERGENCIA "
+                f"{profit_percent * 100:.2f}%"
+            ),
+            "priority": 99
+        }
+
+    # ========================================================
+    # 3. TRAILING STOP
+    # ========================================================
+
+    if (
+        trailing_stop is not None
+        and current_price <= trailing_stop
+    ):
+
+        return {
+            "action": "EXIT",
+            "reason": (
+                "TRAILING STOP ACTIVADO | "
+                f"Stop ${trailing_stop:.2f}"
+            ),
+            "priority": 90
+        }
+
+    # ========================================================
+    # 4. PROTECCIÓN DE GANANCIA
+    # ========================================================
+
+    if (
+        profit_protection is not None
+        and current_price
+        <= profit_protection
+    ):
+
+        return {
+            "action": "EXIT",
+            "reason": (
+                "PROTECCIÓN DE GANANCIA | "
+                f"Precio protegido "
+                f"${profit_protection:.2f}"
+            ),
+            "priority": 85
+        }
+
+    # ========================================================
+    # 5. DETERIORO DE TENDENCIA
+    # ========================================================
+
+    price = indicators["price"]
+    ema20 = indicators["ema20"]
+    sma20 = indicators["sma20"]
+    rsi14 = indicators["rsi14"]
+
+    if (
+        EXIT_BELOW_EMA
+        and price < ema20
+        and rsi14 < EXIT_RSI_LEVEL
+    ):
+
+        return {
+            "action": "EXIT",
+            "reason": (
+                "DETERIORO DE TENDENCIA | "
+                f"Precio < EMA20 | "
+                f"RSI {rsi14:.1f}"
+            ),
+            "priority": 70
+        }
+
+    if (
+        EXIT_BELOW_SMA
+        and price < sma20
+        and rsi14 < EXIT_RSI_LEVEL
+    ):
+
+        return {
+            "action": "EXIT",
+            "reason": (
+                "PÉRDIDA DE SMA20 + "
+                "MOMENTUM DÉBIL"
+            ),
+            "priority": 65
+        }
+
+    # ========================================================
+    # 6. TIEMPO
+    # ========================================================
+
+    holding_days = (
+        calculate_holding_days(
+            db_event
+        )
+    )
+
+    if (
+        holding_days is not None
+        and holding_days >= MAX_HOLDING_DAYS
+        and profit_percent < 0.01
+    ):
+
+        return {
+            "action": "EXIT",
+            "reason": (
+                "SALIDA POR TIEMPO | "
+                f"{holding_days:.1f} días "
+                "sin suficiente progreso"
+            ),
+            "priority": 50
+        }
+
+    # ========================================================
+    # HOLD
+    # ========================================================
+
+    return {
+        "action": "HOLD",
+        "reason": (
+            "POSICIÓN SANA | "
+            f"P/L {profit_percent * 100:.2f}%"
+        ),
+        "priority": 0,
+
+        "profit_percent": profit_percent,
+
+        "original_stop": original_stop,
+
+        "trailing_stop": trailing_stop,
+
+        "profit_protection": (
+            profit_protection
+        ),
+
+        "protective_orders": len(
+            protective_orders
+        )
+    }
+
+
+# ============================================================
+# PROTEGER POSICIÓN
+# ============================================================
+
+
+def ensure_protection(
+    trading_client,
+    symbol,
+    position,
+    db_event,
+    protective_orders
+):
+
+    if protective_orders:
+
+        return True
+
+    original_stop = get_original_stop(
+        symbol,
+        db_event
+    )
+
+    if original_stop is None:
+
+        print(
+            f"[{symbol}] "
+            "⚠️ POSICIÓN SIN STOP CONOCIDO"
+        )
+
+        return False
+
+    current_price = safe_float(
+        position["current_price"]
+    )
+
+    if (
+        current_price <= 0
+        or original_stop >= current_price
+    ):
+
+        print(
+            f"[{symbol}] "
+            "⚠️ STOP INVALIDADO"
+        )
+
+        return False
+
+    quantity = safe_int(
+        position["qty"]
+    )
+
+    if quantity <= 0:
+
+        return False
+
+    try:
+
+        request = StopOrderRequest(
+            symbol=symbol,
+            qty=quantity,
+            side=OrderSide.SELL,
+            time_in_force=TimeInForce.GTC,
+            stop_price=round(
+                original_stop,
+                2
+            )
+        )
+
+        order = (
+            trading_client
+            .submit_order(
+                order_data=request
+            )
+        )
+
+        print(
+            f"[{symbol}] "
+            f"🛡️ STOP RESTAURADO "
+            f"${original_stop:.2f}"
+        )
+
+        return True
+
+    except Exception as error:
+
+        print(
+            f"[{symbol}] "
+            f"❌ ERROR RESTAURANDO STOP: "
+            f"{error}"
+        )
+
+        return False
+
+
+# ============================================================
+# REGISTRAR SALIDA
+# ============================================================
+
+
+def register_exit(
+    symbol,
+    position,
+    reason,
+    order
+):
+
+    try:
+
+        order_id = getattr(
+            order,
+            "id",
+            None
+        )
+
+        log_event(
+            symbol=symbol,
+            signal="VENDER",
+            entry_price=position[
+                "avg_entry_price"
+            ],
+            stop_price=0.0,
+            position_size=safe_int(
+                position["qty"]
+            ),
+            status="EXIT_SUBMITTED",
+            profit_loss=position[
+                "unrealized_pl"
+            ],
+            order_id=order_id
+        )
+
+    except Exception as error:
+
+        print(
+            f"[{symbol}] "
+            f"Error registrando salida: "
+            f"{error}"
+        )
+
+
+# ============================================================
+# POSICIÓN HUÉRFANA
+# ============================================================
+
+
+def handle_unknown_position(
+    symbol,
+    position
+):
+
+    print()
+    print(
+        "⚠️ ================================================"
+    )
+
+    print(
+        f"POSICIÓN NO RECONOCIDA: {symbol}"
+    )
+
+    print(
+        f"Cantidad: {position['qty']}"
+    )
+
+    print(
+        f"Entrada: "
+        f"${position['avg_entry_price']:.2f}"
+    )
+
+    print(
+        "El bot NO la cerrará automáticamente."
+    )
+
+    print(
+        "Se requiere reconciliación."
+    )
+
+    print(
+        "⚠️ ================================================"
+    )
+
+    try:
+
+        log_event(
+            symbol=symbol,
+            signal="DESCONOCIDO",
+            entry_price=position[
+                "avg_entry_price"
+            ],
+            stop_price=0.0,
+            position_size=safe_int(
+                position["qty"]
+            ),
+            status="UNKNOWN_POSITION",
+            profit_loss=position[
+                "unrealized_pl"
+            ]
+        )
+
+    except Exception:
+
+        pass
+
+
+# ============================================================
+# PROCESAR POSICIÓN
+# ============================================================
+
+
+def process_position(
+    trading_client,
+    data_client,
+    symbol,
+    position,
+    open_orders
+):
+
+    print()
+    print(
+        "------------------------------------------------"
+    )
+
+    print(
+        f"🔎 ADMINISTRANDO {symbol}"
+    )
+
+    print(
+        f"Cantidad: "
+        f"{position['qty']}"
+    )
+
+    print(
+        f"Entrada: "
+        f"${position['avg_entry_price']:.2f}"
+    )
+
+    print(
+        f"Actual: "
+        f"${position['current_price']:.2f}"
+    )
+
+    print(
+        f"P/L: "
+        f"${position['unrealized_pl']:.2f}"
+    )
+
+    print(
+        "------------------------------------------------"
+    )
+
+    # --------------------------------------------------------
+    # DB
+    # --------------------------------------------------------
+
+    db_event = None
+
+    try:
+
+        db_event = (
+            get_open_position_event(
+                symbol
+            )
+        )
+
+    except Exception as error:
+
+        print(
+            f"[{symbol}] "
+            f"Error leyendo DB: {error}"
+        )
+
+    if db_event is None:
+
+        handle_unknown_position(
+            symbol,
+            position
+        )
+
+        return "UNKNOWN"
+
+    # --------------------------------------------------------
+    # DATOS
+    # --------------------------------------------------------
+
+    try:
+
+        bars = get_daily_bars(
+            data_client,
+            symbol
+        )
+
+    except Exception as error:
+
+        print(
+            f"[{symbol}] "
+            f"Error descargando datos: "
+            f"{error}"
+        )
+
+        return "DATA_ERROR"
+
+    if len(bars) < MIN_BARS:
+
+        print(
+            f"[{symbol}] "
+            "Datos insuficientes. "
+            "NO SE TOCA LA POSICIÓN."
+        )
+
+        return "DATA_ERROR"
+
+    indicators = (
+        calculate_indicators(
+            bars
+        )
+    )
+
+    if indicators is None:
+
+        print(
+            f"[{symbol}] "
+            "Indicadores inválidos."
+        )
+
+        return "DATA_ERROR"
+
+    print(
+        f"EMA20: "
+        f"${indicators['ema20']:.2f}"
+    )
+
+    print(
+        f"SMA20: "
+        f"${indicators['sma20']:.2f}"
+    )
+
+    print(
+        f"RSI: "
+        f"{indicators['rsi14']:.2f}"
+    )
+
+    print(
+        f"ATR: "
+        f"${indicators['atr']:.2f}"
+    )
+
+    # --------------------------------------------------------
+    # ÓRDENES PROTECTORAS
+    # --------------------------------------------------------
+
+    symbol_orders = open_orders.get(
+        symbol,
+        []
+    )
+
+    protective_orders = (
+        find_protective_orders(
+            symbol,
+            symbol_orders
+        )
+    )
+
+    print(
+        f"Órdenes protectoras: "
+        f"{len(protective_orders)}"
+    )
+
+    # --------------------------------------------------------
+    # EVALUACIÓN
+    # --------------------------------------------------------
+
+    decision = evaluate_position(
+        symbol=symbol,
+        position=position,
+        db_event=db_event,
+        indicators=indicators,
+        protective_orders=protective_orders
+    )
+
+    action = decision["action"]
+
+    print(
+        f"DECISIÓN: {action}"
+    )
+
+    print(
+        f"MOTIVO: "
+        f"{decision['reason']}"
+    )
+
+    # --------------------------------------------------------
+    # SALIDA
+    # --------------------------------------------------------
+
+    if action == "EXIT":
+
+        print()
+        print(
+            f"🚨 {symbol}: "
+            f"SE REQUIERE SALIDA"
+        )
+
+        # ----------------------------------------------
+        # CANCELAR PROTECCIONES
+        # ----------------------------------------------
+
+        if symbol_orders:
+
+            cancel_symbol_orders(
+                trading_client,
+                symbol,
+                symbol_orders
+            )
+
+            # Pequeña pausa para permitir
+            # que Alpaca procese cancelaciones.
+
+            time.sleep(
+                0.50
+            )
+
+        # ----------------------------------------------
+        # REVALIDAR POSICIÓN
+        # ----------------------------------------------
+
+        try:
+
+            fresh_positions = get_positions(
+                trading_client
+            )
+
+        except Exception as error:
+
+            print(
+                f"[{symbol}] "
+                f"No se pudo revalidar posición: "
+                f"{error}"
+            )
+
+            return "EXIT_ABORTED"
+
+        if symbol not in fresh_positions:
+
+            print(
+                f"[{symbol}] "
+                "La posición ya no existe."
+            )
+
+            return "ALREADY_CLOSED"
+
+        fresh_position = (
+            fresh_positions[symbol]
+        )
+
+        quantity = safe_int(
+            fresh_position["qty"]
+        )
+
+        if quantity <= 0:
+
+            return "ALREADY_CLOSED"
+
+        # ----------------------------------------------
+        # SALIDA
+        # ----------------------------------------------
+
+        try:
+
+            order = submit_exit_order(
+                trading_client,
+                symbol,
+                quantity,
+                decision["reason"]
+            )
+
+        except Exception as error:
+
+            print(
+                f"[{symbol}] "
+                f"❌ ERROR EN SALIDA: "
+                f"{error}"
+            )
+
+            return "EXIT_ERROR"
+
+        register_exit(
+            symbol,
+            fresh_position,
+            decision["reason"],
+            order
+        )
+
+        print(
+            f"[{symbol}] "
+            "✅ ORDEN DE SALIDA ENVIADA"
+        )
+
+        return "EXIT_SUBMITTED"
+
+    # --------------------------------------------------------
+    # POSICIÓN NORMAL
+    # --------------------------------------------------------
+
+    if not protective_orders:
+
+        print(
+            f"[{symbol}] "
+            "🛡️ No hay stop visible. "
+            "Intentando restaurarlo..."
+        )
+
+        ensure_protection(
+            trading_client,
+            symbol,
+            position,
+            db_event,
+            protective_orders
+        )
+
+    else:
+
+        print(
+            f"[{symbol}] "
+            "🛡️ Protección presente."
+        )
+
+    # --------------------------------------------------------
+    # INFORMACIÓN DEL TRAILING
+    # --------------------------------------------------------
+
+    trailing_stop = decision.get(
+        "trailing_stop"
+    )
+
+    if trailing_stop is not None:
+
+        print(
+            f"[{symbol}] "
+            f"Trailing dinámico calculado: "
+            f"${trailing_stop:.2f}"
+        )
+
+    profit_protection = (
+        decision.get(
+            "profit_protection"
+        )
+    )
+
+    if profit_protection is not None:
+
+        print(
+            f"[{symbol}] "
+            f"Protección de ganancia: "
+            f"${profit_protection:.2f}"
+        )
+
+    print(
+        f"[{symbol}] "
+        "🟢 POSICIÓN MANTENIDA"
+    )
+
+    return "HOLD"
+
+
+# ============================================================
+# SINCRONIZACIÓN GLOBAL
+# ============================================================
+
+
+def synchronize(
+    trading_client
+):
+
+    positions = get_positions(
+        trading_client
+    )
+
+    orders = get_open_orders(
+        trading_client
+    )
+
+    return (
+        positions,
+        orders
+    )
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+
+def main():
+
+    print()
+    print("=" * 72)
+    print(
+        "          AI TRADER — TRADE MANAGER V1"
+    )
+    print("=" * 72)
+    print()
+
+    initialize_database()
+
+    # --------------------------------------------------------
+    # CLIENTES
+    # --------------------------------------------------------
+
+    try:
+
+        trading_client, data_client = (
+            create_clients()
+        )
+
+    except Exception as error:
+
+        print(
+            f"❌ ERROR CREANDO CLIENTES: "
+            f"{error}"
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # RELOJ
+    # --------------------------------------------------------
+
+    try:
+
+        clock = (
+            trading_client
+            .get_clock()
+        )
+
+    except Exception as error:
+
+        print(
+            f"❌ ERROR OBTENIENDO RELOJ: "
+            f"{error}"
+        )
+
+        return
+
+    if not clock.is_open:
+
+        print(
+            "⏸️ MERCADO CERRADO."
+        )
+
+        print(
+            "Trade Manager no ejecutará salidas "
+            "normales fuera del horario."
+        )
+
+        return
+
+    print(
+        "🟢 MERCADO ABIERTO"
+    )
+
+    print()
+
+    # --------------------------------------------------------
+    # SINCRONIZACIÓN
+    # --------------------------------------------------------
+
+    try:
+
+        positions, open_orders = (
+            synchronize(
+                trading_client
+            )
+        )
+
+    except Exception as error:
+
+        print(
+            f"❌ ERROR DE SINCRONIZACIÓN: "
+            f"{error}"
+        )
+
+        return
+
+    print(
+        f"Posiciones encontradas: "
+        f"{len(positions)}"
+    )
+
+    print(
+        f"Símbolos con órdenes: "
+        f"{len(open_orders)}"
+    )
+
+    print()
+
+    if not positions:
+
+        print(
+            "No hay posiciones que administrar."
+        )
+
+        return
+
+    # --------------------------------------------------------
+    # PROCESAR
+    # --------------------------------------------------------
+
+    results = {}
+
+    for symbol, position in positions.items():
+
+        try:
+
+            result = process_position(
+                trading_client=trading_client,
+                data_client=data_client,
+                symbol=symbol,
+                position=position,
+                open_orders=open_orders
+            )
+
+            results[symbol] = result
+
+        except Exception as error:
+
+            results[symbol] = (
+                "ERROR"
+            )
+
+            print()
+            print(
+                f"❌ ERROR PROCESANDO {symbol}: "
+                f"{error}"
+            )
+
+            traceback.print_exc()
+
+        print()
+
+    # --------------------------------------------------------
+    # RESUMEN
+    # --------------------------------------------------------
+
+    print()
+    print("=" * 72)
+    print(
+        "              RESUMEN TRADE MANAGER"
+    )
+    print("=" * 72)
+
+    for symbol, result in results.items():
+
+        print(
+            f"{symbol:<8} -> {result}"
+        )
+
+    print()
+    print("=" * 72)
+    print(
+        "        TRADE MANAGER V1 — CICLO TERMINADO"
+    )
+    print("=" * 72)
+    print()
+
+
+# ============================================================
+# EJECUCIÓN
+# ============================================================
+
+
+if __name__ == "__main__":
+
+    try:
+
+        main()
+
+    except KeyboardInterrupt:
+
+        print()
+        print(
+            "Ejecución detenida manualmente."
+        )
+
+    except Exception as error:
+
+        print()
+        print(
+            "🚨 KILL SWITCH — ERROR NO CONTROLADO"
+        )
+
+        print(
+            str(error)
+        )
+
+        traceback.print_exc()
+
+        print()
+        print(
+            "NO SE INTENTARÁN MÁS OPERACIONES."
+        )
