@@ -35,7 +35,7 @@ import math
 import time
 import traceback
 import inspect
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import (
@@ -165,6 +165,13 @@ MAX_RSI = 68
 
 REQUEST_DELAY = 0.15
 
+# ============================================================
+# MARKET DATA
+# ============================================================
+
+# Pedimos un margen adicional de días calendario porque
+# LOOKBACK_DAYS representa días de mercado, no días calendario.
+DATA_LOOKBACK_CALENDAR_DAYS = LOOKBACK_DAYS + 40
 
 # ============================================================
 # OUTPUT
@@ -368,24 +375,239 @@ def get_daily_bars(
     data_client,
     symbol
 ):
+    """
+    Descarga barras diarias de un símbolo.
 
-    request = StockBarsRequest(
-        symbol_or_symbols=symbol,
-        timeframe=TimeFrame.Day,
-        limit=LOOKBACK_DAYS,
-        feed=DATA_FEED
+    CORRECCIÓN V4.1:
+    - Usa start/end explícitos.
+    - Solicita suficientes días calendario.
+    - Usa limit alto.
+    - Maneja next_page_token.
+    - Ordena cronológicamente.
+    - Intenta extraer correctamente el símbolo.
+    - Da diagnóstico detallado si Alpaca no devuelve datos.
+    """
+
+    symbol = str(symbol).upper()
+
+    end_time = now_utc()
+
+    start_time = (
+        end_time
+        - timedelta(
+            days=DATA_LOOKBACK_CALENDAR_DAYS
+        )
     )
 
-    response = data_client.get_stock_bars(
-        request
-    )
+    all_bars = []
+
+    page_token = None
+
+    max_pages = 10
+    page_count = 0
+
+    while page_count < max_pages:
+
+        page_count += 1
+
+        request_kwargs = {
+            "symbol_or_symbols": symbol,
+            "timeframe": TimeFrame.Day,
+            "start": start_time,
+            "end": end_time,
+            "limit": 10000,
+            "feed": DATA_FEED
+        }
+
+        if page_token:
+            request_kwargs["page_token"] = page_token
+
+        request = StockBarsRequest(
+            **request_kwargs
+        )
+
+        try:
+
+            response = data_client.get_stock_bars(
+                request
+            )
+
+        except Exception as error:
+
+            print(
+                RED
+                + f"[MARKET DATA] {symbol}: "
+                  f"error solicitando barras: {error}"
+                + RESET
+            )
+
+            return []
+
+        # ----------------------------------------------------
+        # EXTRAER BARRAS
+        # ----------------------------------------------------
+
+        bars = []
+
+        try:
+
+            bars = list(
+                response[symbol]
+            )
+
+        except Exception:
+
+            try:
+
+                data = getattr(
+                    response,
+                    "data",
+                    {}
+                )
+
+                if isinstance(data, dict):
+
+                    bars = list(
+                        data.get(
+                            symbol,
+                            []
+                        )
+                    )
+
+            except Exception:
+
+                bars = []
+
+        # ----------------------------------------------------
+        # ACUMULAR
+        # ----------------------------------------------------
+
+        if bars:
+
+            all_bars.extend(
+                bars
+            )
+
+        # ----------------------------------------------------
+        # PAGINACIÓN
+        # ----------------------------------------------------
+
+        next_token = getattr(
+            response,
+            "next_page_token",
+            None
+        )
+
+        if not next_token:
+
+            break
+
+        if next_token == page_token:
+
+            break
+
+        page_token = next_token
+
+    # --------------------------------------------------------
+    # ORDENAR
+    # --------------------------------------------------------
 
     try:
-        bars = response[symbol]
+
+        all_bars.sort(
+            key=lambda bar: getattr(
+                bar,
+                "timestamp",
+                datetime.min.replace(
+                    tzinfo=timezone.utc
+                )
+            )
+        )
+
     except Exception:
+
+        pass
+
+    # --------------------------------------------------------
+    # ELIMINAR DUPLICADOS
+    # --------------------------------------------------------
+
+    unique_bars = []
+
+    seen_timestamps = set()
+
+    for bar in all_bars:
+
+        timestamp = getattr(
+            bar,
+            "timestamp",
+            None
+        )
+
+        if timestamp is not None:
+
+            if timestamp in seen_timestamps:
+
+                continue
+
+            seen_timestamps.add(
+                timestamp
+            )
+
+        unique_bars.append(
+            bar
+        )
+
+    all_bars = unique_bars
+
+    # --------------------------------------------------------
+    # LIMITAR AL LOOKBACK NECESARIO
+    # --------------------------------------------------------
+
+    if len(all_bars) > LOOKBACK_DAYS:
+
+        all_bars = all_bars[
+            -LOOKBACK_DAYS:
+        ]
+
+    # --------------------------------------------------------
+    # DIAGNÓSTICO
+    # --------------------------------------------------------
+
+    if not all_bars:
+
+        print(
+            RED
+            + f"[MARKET DATA] {symbol}: "
+              "ALPACA DEVOLVIÓ 0 BARRAS."
+            + RESET
+        )
+
+        print(
+            YELLOW
+            + f"[MARKET DATA] Rango solicitado: "
+              f"{start_time.isoformat()} → "
+              f"{end_time.isoformat()}"
+            + RESET
+        )
+
+        print(
+            YELLOW
+            + f"[MARKET DATA] Feed solicitado: "
+              f"{DATA_FEED}"
+            + RESET
+        )
+
         return []
 
-    return list(bars)
+    print(
+        GREEN
+        + f"[MARKET DATA] {symbol}: "
+          f"{len(all_bars)} barras descargadas"
+        + RESET
+    )
+
+    return all_bars
 
 
 # ============================================================
@@ -2082,7 +2304,15 @@ def main():
 
         print(
             RED
-            + "No hay suficientes datos de SPY."
+            + f"SPY NO TIENE SUFICIENTES DATOS: "
+              f"{len(benchmark_bars)}/{MIN_BARS} barras."
+            + RESET
+        )
+
+        print(
+            YELLOW
+            + "El problema está en Market Data, "
+              "no en el scanner."
             + RESET
         )
 
